@@ -45,7 +45,7 @@ void session_input_init(stream_input_t *input, session_t *session, app_input_t *
     input->touchpads = NULL;
     input->touchpad_count = 0;
 #if FEATURE_INPUT_SC2_LINK
-    session_sc2_link_init(&input->sc2_link);
+    session_sc2_link_init(&input->sc2_link, input);
 #endif
 #if FEATURE_INPUT_EVMOUSE
     if (!config->view_only && config->hardware_mouse) {

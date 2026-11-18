@@ -1,21 +1,30 @@
 #pragma once
 
 #include <stdbool.h>
+#include <SDL_atomic.h>
+#include <SDL_thread.h>
 
 typedef struct app_gamepad_state_t app_gamepad_state_t;
+typedef struct stream_input_t stream_input_t;
 
 /**
  * A Steam Controller (2nd generation) behind an OpenPuck dongle in SC2 Link mode.
  *
  * SDL opens the dongle's xpad node as an Xbox 360 pad and cannot open its HID
- * nodes, which carry the full controller state.
+ * nodes, which carry the full controller state. A reader thread sends that
+ * state to the host as a Steam Controller.
  */
 typedef struct session_sc2_link_t {
+    stream_input_t *input;
+    SDL_Thread *thread;
+    SDL_atomic_t stop_requested;
+    int controls_fd;
+    int pads_fd;
     // Controller number of the xpad node whose slot the dongle took, -1 for none.
     short controller_number;
 } session_sc2_link_t;
 
-void session_sc2_link_init(session_sc2_link_t *link);
+void session_sc2_link_init(session_sc2_link_t *link, stream_input_t *input);
 
 /**
  * Called for every SDL controller that joins a stream. Looks for the dongle's
