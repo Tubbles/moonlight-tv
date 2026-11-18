@@ -289,6 +289,17 @@ uint64_t sc2_link_motion_next_due(uint64_t next_due_us, uint64_t now_us, uint32_
     return period_after_due_us > half_period_after_now_us ? period_after_due_us : half_period_after_now_us;
 }
 
+/*
+ * The host's virtual controller repeats its last state, so without a final
+ * zero the last gyroscope reading keeps turning the view while input is
+ * blocked. A zero gyroscope is the halt that moonlight-common-c sends reliably
+ * (InputStream.c, motion packets).
+ */
+bool sc2_link_gyroscope_halt_due(bool arrived, bool was_accepting_input, bool accepting_input,
+                                 uint32_t gyroscope_period_us) {
+    return arrived && was_accepting_input && !accepting_input && gyroscope_period_us != 0;
+}
+
 static sc2_link_pad_t decode_pad(const int32_t axis_values[ABS_CNT], int x_code, int y_code, int pressure_code,
                                  bool touched) {
     sc2_link_pad_t pad = {

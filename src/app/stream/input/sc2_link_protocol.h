@@ -168,3 +168,11 @@ bool sc2_link_motion_due(uint64_t next_due_us, uint64_t now_us, uint32_t period_
 
 /** When the sample after the one sent at now_us is due. */
 uint64_t sc2_link_motion_next_due(uint64_t next_due_us, uint64_t now_us, uint32_t period_us);
+
+/**
+ * Whether the host must get a gyroscope reading of zero: input stopped being
+ * accepted while the controller was announced and the host asked for the
+ * gyroscope (a period above 0), so no further sample goes out.
+ */
+bool sc2_link_gyroscope_halt_due(bool arrived, bool was_accepting_input, bool accepting_input,
+                                 uint32_t gyroscope_period_us);

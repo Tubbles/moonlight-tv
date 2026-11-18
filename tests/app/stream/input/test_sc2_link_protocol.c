@@ -419,6 +419,19 @@ void test_motion_never_sends_two_within_half_a_period(void) {
     TEST_ASSERT_INT_WITHIN(1, 25, sent);
 }
 
+/* Only the step from accepted to blocked input halts the gyroscope, once. */
+void test_gyroscope_halt_on_blocked_input(void) {
+    TEST_ASSERT_TRUE(sc2_link_gyroscope_halt_due(true, true, false, PERIOD_250_HZ_US));
+    TEST_ASSERT_FALSE(sc2_link_gyroscope_halt_due(true, false, false, PERIOD_250_HZ_US));
+    TEST_ASSERT_FALSE(sc2_link_gyroscope_halt_due(true, true, true, PERIOD_250_HZ_US));
+    TEST_ASSERT_FALSE(sc2_link_gyroscope_halt_due(true, false, true, PERIOD_250_HZ_US));
+}
+
+void test_gyroscope_halt_needs_arrival_and_request(void) {
+    TEST_ASSERT_FALSE(sc2_link_gyroscope_halt_due(false, true, false, PERIOD_250_HZ_US));
+    TEST_ASSERT_FALSE(sc2_link_gyroscope_halt_due(true, true, false, 0));
+}
+
 void test_battery_charge_states(void) {
     sc2_link_battery_t battery = sc2_link_battery(battery_status(1, 80));
     TEST_ASSERT_EQUAL_UINT8(LI_BATTERY_STATE_DISCHARGING, battery.state);
@@ -505,6 +518,8 @@ int main() {
     RUN_TEST(test_motion_keeps_every_jittered_sample);
     RUN_TEST(test_motion_holds_the_requested_rate);
     RUN_TEST(test_motion_never_sends_two_within_half_a_period);
+    RUN_TEST(test_gyroscope_halt_on_blocked_input);
+    RUN_TEST(test_gyroscope_halt_needs_arrival_and_request);
     RUN_TEST(test_battery_charge_states);
     RUN_TEST(test_battery_other_charge_states_are_unknown);
     RUN_TEST(test_battery_percent_passes_as_reported);

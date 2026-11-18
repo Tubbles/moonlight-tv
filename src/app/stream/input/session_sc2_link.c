@@ -50,6 +50,8 @@ typedef struct controller_reader_t {
     node_reader_t pads;
     node_reader_t motion;
     bool arrived;
+    // At the last controls frame of a connected controller.
+    bool input_accepted;
     // What the host was last sent, so only changes go out.
     sc2_link_gamepad_state_t sent_state;
     sc2_link_pads_t sent_pads;
@@ -369,7 +371,16 @@ static void handle_controls_frame(controller_reader_t *reader) {
         // Nothing else: any state sent before the arrival makes the host create its default pad for this number.
         return;
     }
-    if (!accepting_input(reader)) {
+    // Checked here rather than on motion frames: the sample counter gives the
+    // controls node a frame for every state, a still controller included.
+    bool input_accepted = accepting_input(reader);
+    if (sc2_link_gyroscope_halt_due(reader->arrived, reader->input_accepted, input_accepted,
+                                    motion_period_us(reader, LI_MOTION_TYPE_GYRO))) {
+        LiSendControllerMotionEvent((uint8_t) reader->link->controller_number, LI_MOTION_TYPE_GYRO,
+                                    0.0f, 0.0f, 0.0f);
+    }
+    reader->input_accepted = input_accepted;
+    if (!input_accepted) {
         return;
     }
     if (!reader->arrived) {
