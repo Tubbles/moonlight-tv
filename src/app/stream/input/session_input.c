@@ -44,6 +44,9 @@ void session_input_init(stream_input_t *input, session_t *session, app_input_t *
                                               : -TOUCHPAD_SCROLL_FINGER_SCALE;
     input->touchpads = NULL;
     input->touchpad_count = 0;
+#if FEATURE_INPUT_SC2_LINK
+    session_sc2_link_init(&input->sc2_link);
+#endif
 #if FEATURE_INPUT_EVMOUSE
     if (!config->view_only && config->hardware_mouse) {
         session_evmouse_init(&input->evmouse, session);
@@ -53,6 +56,9 @@ void session_input_init(stream_input_t *input, session_t *session, app_input_t *
 
 void session_input_deinit(stream_input_t *input) {
     stream_input_touchpad_mouse_deinit(input);
+#if FEATURE_INPUT_SC2_LINK
+    session_sc2_link_stop(&input->sc2_link);
+#endif
 #if FEATURE_INPUT_EVMOUSE
     const session_config_t *config = &input->session->config;
     if (!config->view_only && config->hardware_mouse) {
@@ -80,11 +86,19 @@ void session_input_started(stream_input_t *input) {
         if (gamepad == NULL) {
             continue;
         }
+#if FEATURE_INPUT_SC2_LINK
+        if (!input->view_only && session_sc2_link_take_over(&input->sc2_link, gamepad)) {
+            continue;
+        }
+#endif
         stream_input_send_gamepad_arrive(input, gamepad);
     }
 }
 
 void session_input_stopped(stream_input_t *input) {
+#if FEATURE_INPUT_SC2_LINK
+    session_sc2_link_stop(&input->sc2_link);
+#endif
     input->started = false;
     stream_input_touchpad_mouse_deinit(input);
 }

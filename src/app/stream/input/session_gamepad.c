@@ -617,6 +617,11 @@ void stream_input_handle_cdevice(stream_input_t *input, const SDL_ControllerDevi
     if (input->view_only) {
         return;
     }
+#if FEATURE_INPUT_SC2_LINK
+    if (session_sc2_link_take_over(&input->sc2_link, gamepad)) {
+        return;
+    }
+#endif
     stream_input_send_gamepad_arrive(input, gamepad);
 }
 

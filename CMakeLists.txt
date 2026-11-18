@@ -80,6 +80,7 @@ set(FEATURE_I18N_LANGUAGE_SETTINGS OFF)
 set(FEATURE_SURROUND_SOUND ON)
 set(FEATURE_CHECK_MODULE_OS_VERSION OFF)
 set(FEATURE_INPUT_EVMOUSE OFF)
+set(FEATURE_INPUT_SC2_LINK OFF)
 # webOS routes controller touchpads into the touchscreen pipeline, where the
 # compositor consumes edge swipes as navigation gestures. Off elsewhere until
 # another platform is known to need it.
@@ -286,6 +287,7 @@ if (TARGET_WEBOS)
     set(FEATURE_INPUT_LIBCEC OFF)
     set(FEATURE_WINDOW_FULLSCREEN_DESKTOP OFF)
     set(FEATURE_INPUT_EVMOUSE ON)
+    set(FEATURE_INPUT_SC2_LINK ON)
 
     target_compile_definitions(moonlight-lib PUBLIC TARGET_WEBOS OS_LINUX _GNU_SOURCE APPID="${WEBOS_APPINFO_ID}")
     target_compile_definitions(moonlight-lib PUBLIC GAMECONTROLLERDB_PLATFORM="webOS" GAMECONTROLLERDB_PLATFORM_USE="Linux")

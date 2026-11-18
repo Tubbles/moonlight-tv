@@ -8,3 +8,10 @@ target_sources(moonlight-lib PRIVATE
 if (FEATURE_INPUT_EVMOUSE)
     target_sources(moonlight-lib PRIVATE session_evmouse.c)
 endif ()
+# Pure functions only, built on every Linux target so the desktop build can test them.
+if (OS_LINUX)
+    target_sources(moonlight-lib PRIVATE sc2_link_protocol.c)
+endif ()
+if (FEATURE_INPUT_SC2_LINK)
+    target_sources(moonlight-lib PRIVATE session_sc2_link.c)
+endif ()

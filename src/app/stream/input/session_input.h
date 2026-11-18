@@ -14,6 +14,12 @@
 
 #endif
 
+#if FEATURE_INPUT_SC2_LINK
+
+#include "session_sc2_link.h"
+
+#endif
+
 typedef struct app_input_t app_input_t;
 typedef struct session_config_t session_config_t;
 typedef struct session_t session_t;
@@ -45,6 +51,9 @@ typedef struct stream_input_t {
     session_input_touchpad_t *touchpads;
 #if FEATURE_INPUT_EVMOUSE
     session_evmouse_t evmouse;
+#endif
+#if FEATURE_INPUT_SC2_LINK
+    session_sc2_link_t sc2_link;
 #endif
 } stream_input_t;
 
