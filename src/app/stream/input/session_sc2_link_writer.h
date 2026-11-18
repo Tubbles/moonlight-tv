@@ -31,7 +31,10 @@ typedef enum sc2_link_output_t {
  */
 sc2_link_writer_t *sc2_link_writer_start(const char *xpad_path, int pads_fd);
 
-/** Ends the session and the thread, and closes the xpad node. */
+/**
+ * Ends the session with BYE, ends the thread and closes the xpad node. The
+ * reader must still pass on acknowledgements until this returns.
+ */
 void sc2_link_writer_stop(sc2_link_writer_t *writer);
 
 /** Frees a stopped writer. */
@@ -39,6 +42,9 @@ void sc2_link_writer_destroy(sc2_link_writer_t *writer);
 
 /** Asks for a session to be opened. */
 void sc2_link_writer_want_output(sc2_link_writer_t *writer);
+
+/** Asks for the session to be ended with BYE and the xpad node to be closed. */
+void sc2_link_writer_release_output(sc2_link_writer_t *writer);
 
 /** ACK_ECHO and ACK_STATE from a frame of the pads node. */
 void sc2_link_writer_note_acknowledgement(sc2_link_writer_t *writer, uint16_t echo, uint16_t state);

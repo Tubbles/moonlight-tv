@@ -65,6 +65,10 @@ static void close_xpad_node(sc2_link_writer_t *writer);
 
 static void set_output(sc2_link_writer_t *writer, sc2_link_output_t output);
 
+static void set_output_after_close(sc2_link_writer_t *writer);
+
+static void apply_output(sc2_link_writer_t *writer, sc2_link_output_t output);
+
 static bool must_close(const sc2_link_writer_t *writer);
 
 static void stop_other_effects(sc2_link_writer_t *writer);
@@ -147,6 +151,13 @@ void sc2_link_writer_want_output(sc2_link_writer_t *writer) {
     SDL_UnlockMutex(writer->lock);
 }
 
+void sc2_link_writer_release_output(sc2_link_writer_t *writer) {
+    SDL_LockMutex(writer->lock);
+    writer->output_wanted = false;
+    SDL_CondBroadcast(writer->changed);
+    SDL_UnlockMutex(writer->lock);
+}
+
 /* Only changes count: each accepted word changes the count in ACK_STATE, and pad movement changes neither field. */
 void sc2_link_writer_note_acknowledgement(sc2_link_writer_t *writer, uint16_t echo, uint16_t state) {
     SDL_LockMutex(writer->lock);
@@ -192,13 +203,16 @@ static int writer_main(sc2_link_writer_t *writer) {
             set_output(writer, SC2_LINK_OUTPUT_OPEN);
             commons_log_info("SC2Link", "Rumble and haptics session open on %s", writer->xpad_path);
             result = serve(writer, &transport);
+            if (result == SC2_LINK_CLIENT_STOPPED) {
+                sc2_link_client_bye(&writer->client, &transport);
+            }
         }
         close_xpad_node(writer);
         if (result == SC2_LINK_CLIENT_FAILED) {
             set_output(writer, SC2_LINK_OUTPUT_UNAVAILABLE);
             break;
         }
-        set_output(writer, SC2_LINK_OUTPUT_IDLE);
+        set_output_after_close(writer);
     }
     return 0;
 }
@@ -295,15 +309,30 @@ static void close_xpad_node(sc2_link_writer_t *writer) {
     writer->client.in_session = false;
 }
 
-/* Messages wait for an open session only. */
 static void set_output(sc2_link_writer_t *writer, sc2_link_output_t output) {
     SDL_LockMutex(writer->lock);
+    apply_output(writer, output);
+    SDL_UnlockMutex(writer->lock);
+}
+
+/*
+ * A controller that came back while the session closed gets a new session.
+ * Decided under the same lock as the change, since want_output() leaves a
+ * closing session's output alone.
+ */
+static void set_output_after_close(sc2_link_writer_t *writer) {
+    SDL_LockMutex(writer->lock);
+    apply_output(writer, must_close(writer) ? SC2_LINK_OUTPUT_IDLE : SC2_LINK_OUTPUT_OPENING);
+    SDL_UnlockMutex(writer->lock);
+}
+
+/* With lock held. Messages wait only for a session that is open or opening. */
+static void apply_output(sc2_link_writer_t *writer, sc2_link_output_t output) {
     writer->output = output;
     if (output == SC2_LINK_OUTPUT_IDLE || output == SC2_LINK_OUTPUT_UNAVAILABLE) {
         writer->queue.count = 0;
     }
     SDL_CondBroadcast(writer->changed);
-    SDL_UnlockMutex(writer->lock);
 }
 
 /* With lock held. */

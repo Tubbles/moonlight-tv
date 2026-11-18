@@ -436,6 +436,11 @@ static void handle_controls_frame(controller_reader_t *reader) {
         if (reader->arrived) {
             send_removal(reader);
         }
+        if (reader->output_wanted) {
+            // Opened again with the next arrival.
+            sc2_link_writer_release_output(reader->writer);
+            reader->output_wanted = false;
+        }
         // Nothing else: any state sent before the arrival makes the host create its default pad for this number.
         return;
     }
