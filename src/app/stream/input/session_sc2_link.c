@@ -29,9 +29,10 @@
 #define POLL_TIMEOUT_MS 50
 #define EVENT_BATCH_SIZE 64
 
-// No haptics yet: nothing plays them.
 #define ARRIVAL_CAPABILITIES (LI_CCAP_ANALOG_TRIGGERS | LI_CCAP_TOUCHPAD | LI_CCAP_DUAL_TOUCHPAD | LI_CCAP_ACCEL | \
                               LI_CCAP_GYRO | LI_CCAP_BATTERY_STATE)
+// Only with a word protocol session open, which plays both.
+#define OUTPUT_CAPABILITIES (LI_CCAP_RUMBLE | LI_CCAP_HAPTICS)
 
 typedef struct node_location_t {
     char path[NODE_PATH_MAX];
@@ -80,6 +81,8 @@ static bool start_reader(session_sc2_link_t *link, short controller_number, cons
 
 static void start_writer(session_sc2_link_t *link, const node_location_t *controls);
 
+static bool offer(session_sc2_link_t *link, uint16_t controller_number, const sc2_link_message_t *message);
+
 static int open_node(const char *path);
 
 static void close_nodes(session_sc2_link_t *link);
@@ -97,6 +100,8 @@ static void handle_controls_frame(controller_reader_t *reader);
 static void handle_pads_frame(controller_reader_t *reader);
 
 static void handle_motion_frame(controller_reader_t *reader);
+
+static bool output_opening(const controller_reader_t *reader);
 
 static void send_arrival(controller_reader_t *reader);
 
@@ -123,6 +128,7 @@ void session_sc2_link_init(session_sc2_link_t *link, stream_input_t *input) {
     link->pads_fd = -1;
     link->motion_fd = -1;
     link->writer = NULL;
+    link->writer_lock = 0;
     link->controller_number = -1;
 }
 
@@ -165,12 +171,41 @@ void session_sc2_link_stop(session_sc2_link_t *link) {
         SDL_WaitThread(link->thread, NULL);
         link->thread = NULL;
     }
-    if (link->writer != NULL) {
-        sc2_link_writer_destroy(link->writer);
-        link->writer = NULL;
+    SDL_AtomicLock(&link->writer_lock);
+    sc2_link_writer_t *writer = link->writer;
+    link->writer = NULL;
+    SDL_AtomicUnlock(&link->writer_lock);
+    if (writer != NULL) {
+        sc2_link_writer_destroy(writer);
     }
     close_nodes(link);
     link->controller_number = -1;
+}
+
+bool session_sc2_link_rumble(session_sc2_link_t *link, uint16_t controller_number, uint16_t low_frequency_motor,
+                             uint16_t high_frequency_motor) {
+    sc2_link_message_t message = sc2_link_rumble_message(low_frequency_motor, high_frequency_motor);
+    return offer(link, controller_number, &message);
+}
+
+void session_sc2_link_haptics(session_sc2_link_t *link, uint16_t controller_number,
+                              const LI_CONTROLLER_HAPTIC_EFFECT *effect) {
+    sc2_link_message_t message;
+    if (sc2_link_haptic_effect_message(effect, &message)) {
+        offer(link, controller_number, &message);
+    }
+}
+
+/*
+ * controller_number only changes while writer is NULL, so it holds still
+ * under the lock too.
+ */
+static bool offer(session_sc2_link_t *link, uint16_t controller_number, const sc2_link_message_t *message) {
+    SDL_AtomicLock(&link->writer_lock);
+    bool taken = link->writer != NULL && session_sc2_link_owns(link, (short) controller_number) &&
+                 sc2_link_writer_offer(link->writer, message);
+    SDL_AtomicUnlock(&link->writer_lock);
+    return taken;
 }
 
 static bool is_sc2_link_xpad(const app_gamepad_state_t *gamepad) {
@@ -261,7 +296,10 @@ static void start_writer(session_sc2_link_t *link, const node_location_t *contro
                                     "haptics");
         return;
     }
-    link->writer = sc2_link_writer_start(xpad.path, link->pads_fd);
+    sc2_link_writer_t *writer = sc2_link_writer_start(xpad.path, link->pads_fd);
+    SDL_AtomicLock(&link->writer_lock);
+    link->writer = writer;
+    SDL_AtomicUnlock(&link->writer_lock);
 }
 
 /** Grabbed, so nothing else on the TV acts on the node while the stream reads it. */
@@ -418,6 +456,9 @@ static void handle_controls_frame(controller_reader_t *reader) {
         return;
     }
     if (!reader->arrived) {
+        if (output_opening(reader)) {
+            return;
+        }
         send_arrival(reader);
     }
     send_battery(reader, controls.status);
@@ -457,6 +498,17 @@ static void handle_motion_frame(controller_reader_t *reader) {
                 sc2_link_angular_velocity(&motion));
 }
 
+/*
+ * The arrival waits for HELLO, as it says whether the controller plays rumble
+ * and haptics and a second arrival would make the host create a new
+ * controller. That holds back the controller's input for some milliseconds,
+ * or around a second when the dongle needs 600 ms of silence first or does
+ * not answer.
+ */
+static bool output_opening(const controller_reader_t *reader) {
+    return reader->writer != NULL && sc2_link_writer_output(reader->writer) == SC2_LINK_OUTPUT_OPENING;
+}
+
 /**
  * The host makes a new controller for every arrival, which starts with the
  * neutral state the arrival also sends, no touch and no battery.
@@ -464,9 +516,14 @@ static void handle_motion_frame(controller_reader_t *reader) {
 static void send_arrival(controller_reader_t *reader) {
     short controller_number = reader->link->controller_number;
     short active_gamepad_mask = app_input_gamepads_mask(reader->link->input->input);
-    commons_log_info("SC2Link", "Steam Controller arrived as controller #%d", controller_number);
+    uint16_t capabilities = ARRIVAL_CAPABILITIES;
+    if (reader->writer != NULL && sc2_link_writer_output(reader->writer) == SC2_LINK_OUTPUT_OPEN) {
+        capabilities |= OUTPUT_CAPABILITIES;
+    }
+    commons_log_info("SC2Link", "Steam Controller arrived as controller #%d, capabilities 0x%x", controller_number,
+                     capabilities);
     LiSendControllerArrivalEvent((uint8_t) controller_number, (uint16_t) active_gamepad_mask, LI_CTYPE_STEAM,
-                                 sc2_link_supported_button_flags(), ARRIVAL_CAPABILITIES);
+                                 sc2_link_supported_button_flags(), capabilities);
     reader->arrived = true;
     memset(&reader->sent_state, 0, sizeof(reader->sent_state));
     memset(&reader->sent_pads, 0, sizeof(reader->sent_pads));

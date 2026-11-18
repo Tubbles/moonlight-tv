@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "sc2_link_words.h"
+
 /**
  * The output half of an SC2 Link dongle: a thread that keeps a word protocol
  * session open on the dongle's xpad node and sends the queued messages through
@@ -40,3 +42,13 @@ void sc2_link_writer_want_output(sc2_link_writer_t *writer);
 
 /** ACK_ECHO and ACK_STATE from a frame of the pads node. */
 void sc2_link_writer_note_acknowledgement(sc2_link_writer_t *writer, uint16_t echo, uint16_t state);
+
+sc2_link_output_t sc2_link_writer_output(sc2_link_writer_t *writer);
+
+/**
+ * Queues a message for the session. A message that comes while the session
+ * closes is dropped.
+ *
+ * @return false when no session is open or opening, and the message was not taken.
+ */
+bool sc2_link_writer_offer(sc2_link_writer_t *writer, const sc2_link_message_t *message);

@@ -51,6 +51,11 @@ static void connection_stage_failed(int stage, int errorCode) {
 
 static void connection_rumble(unsigned short controllerNumber, unsigned short lowFreqMotor,
                               unsigned short highFreqMotor) {
+#if FEATURE_INPUT_SC2_LINK
+    if (session_sc2_link_rumble(&current_session->input.sc2_link, controllerNumber, lowFreqMotor, highFreqMotor)) {
+        return;
+    }
+#endif
     app_input_gamepad_rumble(&current_session->app->input, controllerNumber, lowFreqMotor, highFreqMotor);
 }
 
@@ -71,6 +76,12 @@ static void connection_set_hdr(bool hdrEnabled) {
     streaming_set_hdr(current_session, hdrEnabled);
 }
 
+#if FEATURE_INPUT_SC2_LINK
+static void connection_set_controller_haptics(uint16_t controllerNumber, const LI_CONTROLLER_HAPTIC_EFFECT *effect) {
+    session_sc2_link_haptics(&current_session->input.sc2_link, controllerNumber, effect);
+}
+#endif
+
 CONNECTION_LISTENER_CALLBACKS connection_callbacks = {
         .stageStarting = NULL,
         .stageComplete = NULL,
@@ -83,7 +94,10 @@ CONNECTION_LISTENER_CALLBACKS connection_callbacks = {
         .setMotionEventState = connection_set_motion_event_state,
         .setControllerLED = connection_set_controller_led,
         .connectionStatusUpdate = connection_status_update,
-        .setHdrMode = connection_set_hdr
+        .setHdrMode = connection_set_hdr,
+#if FEATURE_INPUT_SC2_LINK
+        .setControllerHaptics = connection_set_controller_haptics,
+#endif
 };
 
 

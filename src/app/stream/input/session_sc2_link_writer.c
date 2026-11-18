@@ -159,6 +159,25 @@ void sc2_link_writer_note_acknowledgement(sc2_link_writer_t *writer, uint16_t ec
     SDL_UnlockMutex(writer->lock);
 }
 
+sc2_link_output_t sc2_link_writer_output(sc2_link_writer_t *writer) {
+    SDL_LockMutex(writer->lock);
+    sc2_link_output_t output = writer->output;
+    SDL_UnlockMutex(writer->lock);
+    return output;
+}
+
+/* Taking what it drops keeps it off SDL, which would play it into the words. */
+bool sc2_link_writer_offer(sc2_link_writer_t *writer, const sc2_link_message_t *message) {
+    SDL_LockMutex(writer->lock);
+    bool taken = writer->output == SC2_LINK_OUTPUT_OPENING || writer->output == SC2_LINK_OUTPUT_OPEN;
+    if (taken && !must_close(writer)) {
+        sc2_link_queue_push(&writer->queue, message);
+        SDL_CondBroadcast(writer->changed);
+    }
+    SDL_UnlockMutex(writer->lock);
+    return taken;
+}
+
 static int writer_main(sc2_link_writer_t *writer) {
     sc2_link_transport_t transport = {
             .context = writer,
