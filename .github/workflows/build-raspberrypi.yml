@@ -1,15 +1,7 @@
 name: Build (Raspberry Pi)
 
 on:
-  push:
-    # Don't run for tags
-    tags-ignore:
-      - 'v*.*.*'
-    branches:
-      - '**'
-  pull_request:
-    branches:
-      - '**'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
