@@ -6,12 +6,19 @@
 
 #define CONTROLS_INTERFACE_SUFFIX "/input1"
 #define PADS_INTERFACE_SUFFIX "/input2"
+#define MOTION_INTERFACE_SUFFIX "/input3"
 
 #define STATUS_CONNECTED 0x0001
 #define PADS_LEFT_TOUCHED 0x0001
 #define PADS_RIGHT_TOUCHED 0x0002
 
 #define TRIGGER_FULL_SCALE 32767u
+
+// Full scales of the raw IMU mode, which the dongle forces, as SDL's triton driver reads them.
+#define SENSOR_RAW_FULL_SCALE 32768.0f
+#define ACCELEROMETER_FULL_SCALE_G 2.0f
+#define GYROSCOPE_FULL_SCALE_DEGREES_PER_SECOND 2000.0f
+#define STANDARD_GRAVITY 9.80665f
 
 typedef struct button_mapping_t {
     uint32_t controller_bit;
@@ -63,6 +70,8 @@ static bool ends_with(const char *text, const char *suffix);
 static sc2_link_pad_t decode_pad(const int32_t axis_values[ABS_CNT], int x_code, int y_code, int pressure_code,
                                  bool touched);
 
+static sc2_link_vector_t sdl_sensor_axes(int16_t raw_x, int16_t raw_y, int16_t raw_z, float full_scale);
+
 sc2_link_node_role_t sc2_link_node_role(uint16_t vendor, uint16_t product, const char *name, const char *phys) {
     if (vendor != SC2_LINK_VENDOR_ID || product != SC2_LINK_PRODUCT_ID ||
         strcmp(name, SC2_LINK_HID_NODE_NAME) != 0) {
@@ -73,6 +82,9 @@ sc2_link_node_role_t sc2_link_node_role(uint16_t vendor, uint16_t product, const
     }
     if (ends_with(phys, PADS_INTERFACE_SUFFIX)) {
         return SC2_LINK_NODE_PADS;
+    }
+    if (ends_with(phys, MOTION_INTERFACE_SUFFIX)) {
+        return SC2_LINK_NODE_MOTION;
     }
     return SC2_LINK_NODE_OTHER;
 }
@@ -119,6 +131,18 @@ sc2_link_pads_t sc2_link_decode_pads(const int32_t axis_values[ABS_CNT]) {
             },
     };
     return pads;
+}
+
+sc2_link_motion_t sc2_link_decode_motion(const int32_t axis_values[ABS_CNT]) {
+    sc2_link_motion_t motion = {
+            .accelerometer_x = (int16_t) axis_values[ABS_X],
+            .accelerometer_y = (int16_t) axis_values[ABS_Z],
+            .accelerometer_z = (int16_t) axis_values[ABS_RX],
+            .gyroscope_x = (int16_t) axis_values[ABS_RY],
+            .gyroscope_y = (int16_t) axis_values[ABS_THROTTLE],
+            .gyroscope_z = (int16_t) axis_values[ABS_RUDDER],
+    };
+    return motion;
 }
 
 bool sc2_link_controller_connected(const sc2_link_controls_t *controls) {
@@ -200,6 +224,36 @@ int sc2_link_touch_event_type(const sc2_link_pad_t *sent, const sc2_link_pad_t *
     return SC2_LINK_NO_TOUCH_EVENT;
 }
 
+sc2_link_vector_t sc2_link_acceleration(const sc2_link_motion_t *motion) {
+    return sdl_sensor_axes(motion->accelerometer_x, motion->accelerometer_y, motion->accelerometer_z,
+                           ACCELEROMETER_FULL_SCALE_G * STANDARD_GRAVITY);
+}
+
+sc2_link_vector_t sc2_link_angular_velocity(const sc2_link_motion_t *motion) {
+    return sdl_sensor_axes(motion->gyroscope_x, motion->gyroscope_y, motion->gyroscope_z,
+                           GYROSCOPE_FULL_SCALE_DEGREES_PER_SECOND);
+}
+
+bool sc2_link_motion_due(uint64_t next_due_us, uint64_t now_us, uint32_t period_us) {
+    return period_us != 0 && now_us >= next_due_us;
+}
+
+/*
+ * The next sample is due a full period after this one was due, or half a
+ * period after this one went out if that is later. So a sample can go out up
+ * to half a period early, and the jitter of the samples' arrival does not drop
+ * those that come in early: the dongle sends one about every 4 ms and USB polls
+ * it every 1 ms, while the host asks for 250 Hz, a period of 4 ms. The due time
+ * still moves on by at least a period per sample sent, so on average no more
+ * samples go out than the host asked for, and no two less than half a period
+ * apart.
+ */
+uint64_t sc2_link_motion_next_due(uint64_t next_due_us, uint64_t now_us, uint32_t period_us) {
+    uint64_t period_after_due_us = next_due_us + period_us;
+    uint64_t half_period_after_now_us = now_us + (period_us - period_us / 2);
+    return period_after_due_us > half_period_after_now_us ? period_after_due_us : half_period_after_now_us;
+}
+
 static sc2_link_pad_t decode_pad(const int32_t axis_values[ABS_CNT], int x_code, int y_code, int pressure_code,
                                  bool touched) {
     sc2_link_pad_t pad = {
@@ -209,6 +263,28 @@ static sc2_link_pad_t decode_pad(const int32_t axis_values[ABS_CNT], int x_code,
             .touched = touched,
     };
     return pad;
+}
+
+/*
+ * Raw x, z and the negated raw y become the x, y and z that
+ * LiSendControllerMotionEvent() takes, scaled to full_scale at a raw 32768.
+ * This is what SDL's triton driver does with the same raw values
+ * (HIDAPI_DriverSteamTriton_HandleState() in
+ * src/joystick/hidapi/SDL_hidapi_steam_triton.c, SDL fda4ece277), except that
+ * Moonlight takes degrees per second where SDL gives radians. Sunshine passes
+ * the values to libvirtualhid unchanged (gamepad_motion() in
+ * src/platform/virtualhid_input.cpp), and libvirtualhid's
+ * pack_steam_controller_input_report() (src/core/report.cpp, e9ede639) writes
+ * x, -z and y back at 32768 / (2 g) and 32768 / 2000, so Steam on the host
+ * reads the controller's raw values again.
+ */
+static sc2_link_vector_t sdl_sensor_axes(int16_t raw_x, int16_t raw_y, int16_t raw_z, float full_scale) {
+    sc2_link_vector_t vector = {
+            .x = (float) raw_x / SENSOR_RAW_FULL_SCALE * full_scale,
+            .y = (float) raw_z / SENSOR_RAW_FULL_SCALE * full_scale,
+            .z = -(float) raw_y / SENSOR_RAW_FULL_SCALE * full_scale,
+    };
+    return vector;
 }
 
 static bool ends_with(const char *text, const char *suffix) {

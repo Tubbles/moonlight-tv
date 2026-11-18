@@ -20,6 +20,7 @@ typedef struct session_sc2_link_t {
     SDL_atomic_t stop_requested;
     int controls_fd;
     int pads_fd;
+    int motion_fd;
     // Controller number of the xpad node whose slot the dongle took, -1 for none.
     short controller_number;
 } session_sc2_link_t;

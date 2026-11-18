@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <linux/input.h>
@@ -27,8 +28,9 @@
 #define POLL_TIMEOUT_MS 50
 #define EVENT_BATCH_SIZE 64
 
-// No motion, battery or haptics yet: nothing reads or plays them.
-#define ARRIVAL_CAPABILITIES (LI_CCAP_ANALOG_TRIGGERS | LI_CCAP_TOUCHPAD | LI_CCAP_DUAL_TOUCHPAD)
+// No battery or haptics yet: nothing reads or plays them.
+#define ARRIVAL_CAPABILITIES (LI_CCAP_ANALOG_TRIGGERS | LI_CCAP_TOUCHPAD | LI_CCAP_DUAL_TOUCHPAD | LI_CCAP_ACCEL | \
+                              LI_CCAP_GYRO)
 
 typedef struct node_location_t {
     char path[NODE_PATH_MAX];
@@ -46,24 +48,28 @@ typedef struct controller_reader_t {
     session_sc2_link_t *link;
     node_reader_t controls;
     node_reader_t pads;
+    node_reader_t motion;
     bool arrived;
     // What the host was last sent, so only changes go out.
     sc2_link_gamepad_state_t sent_state;
     sc2_link_pads_t sent_pads;
+    // See sc2_link_motion_due().
+    uint64_t acceleration_next_due_us;
+    uint64_t angular_velocity_next_due_us;
 } controller_reader_t;
 
 typedef void (*frame_handler_t)(controller_reader_t *reader);
 
 static bool is_sc2_link_xpad(const app_gamepad_state_t *gamepad);
 
-static bool find_hid_nodes(node_location_t *controls, node_location_t *pads);
+static bool find_hid_nodes(node_location_t *controls, node_location_t *pads, node_location_t *motion);
 
 static bool find_node(sc2_link_node_role_t role, const char *dongle_phys, node_location_t *location);
 
 static sc2_link_node_role_t node_role(int fd, char phys[NODE_TEXT_MAX]);
 
 static bool start_reader(session_sc2_link_t *link, short controller_number, const node_location_t *controls,
-                         const node_location_t *pads);
+                         const node_location_t *pads, const node_location_t *motion);
 
 static int open_node(const char *path);
 
@@ -81,9 +87,18 @@ static void handle_controls_frame(controller_reader_t *reader);
 
 static void handle_pads_frame(controller_reader_t *reader);
 
+static void handle_motion_frame(controller_reader_t *reader);
+
 static void send_arrival(controller_reader_t *reader);
 
 static void send_touch(controller_reader_t *reader, uint8_t pad_index, const sc2_link_pad_t *pad);
+
+static void send_motion(controller_reader_t *reader, uint8_t motion_type, uint64_t *next_due_us, uint64_t now_us,
+                        sc2_link_vector_t value);
+
+static uint32_t motion_period_us(const controller_reader_t *reader, uint8_t motion_type);
+
+static uint64_t monotonic_time_us(void);
 
 static bool accepting_input(const controller_reader_t *reader);
 
@@ -93,6 +108,7 @@ void session_sc2_link_init(session_sc2_link_t *link, stream_input_t *input) {
     SDL_AtomicSet(&link->stop_requested, 0);
     link->controls_fd = -1;
     link->pads_fd = -1;
+    link->motion_fd = -1;
     link->controller_number = -1;
 }
 
@@ -110,15 +126,15 @@ bool session_sc2_link_take_over(session_sc2_link_t *link, const app_gamepad_stat
         return false;
     }
     session_sc2_link_stop(link);
-    node_location_t controls, pads;
-    if (!find_hid_nodes(&controls, &pads)) {
+    node_location_t controls, pads, motion;
+    if (!find_hid_nodes(&controls, &pads, &motion)) {
         commons_log_warn("SC2Link", "Controller #%d is an SC2 Link dongle, but its HID nodes were not found",
                          gamepad->gs_id);
         return false;
     }
-    commons_log_info("SC2Link", "Controller #%d is an SC2 Link dongle: controls %s, pads %s", gamepad->gs_id,
-                     controls.path, pads.path);
-    return start_reader(link, gamepad->gs_id, &controls, &pads);
+    commons_log_info("SC2Link", "Controller #%d is an SC2 Link dongle: controls %s, pads %s, motion %s",
+                     gamepad->gs_id, controls.path, pads.path, motion.path);
+    return start_reader(link, gamepad->gs_id, &controls, &pads, &motion);
 }
 
 bool session_sc2_link_owns(const session_sc2_link_t *link, short controller_number) {
@@ -144,11 +160,12 @@ static bool is_sc2_link_xpad(const app_gamepad_state_t *gamepad) {
 
 /**
  * Supports one dongle: with several, the first controls node found wins, and
- * its pads node must share its USB device.
+ * its pads and motion nodes must share its USB device.
  */
-static bool find_hid_nodes(node_location_t *controls, node_location_t *pads) {
+static bool find_hid_nodes(node_location_t *controls, node_location_t *pads, node_location_t *motion) {
     return find_node(SC2_LINK_NODE_CONTROLS, NULL, controls) &&
-           find_node(SC2_LINK_NODE_PADS, controls->phys, pads);
+           find_node(SC2_LINK_NODE_PADS, controls->phys, pads) &&
+           find_node(SC2_LINK_NODE_MOTION, controls->phys, motion);
 }
 
 static bool find_node(sc2_link_node_role_t role, const char *dongle_phys, node_location_t *location) {
@@ -190,10 +207,11 @@ static sc2_link_node_role_t node_role(int fd, char phys[NODE_TEXT_MAX]) {
 }
 
 static bool start_reader(session_sc2_link_t *link, short controller_number, const node_location_t *controls,
-                         const node_location_t *pads) {
+                         const node_location_t *pads, const node_location_t *motion) {
     link->controls_fd = open_node(controls->path);
     link->pads_fd = open_node(pads->path);
-    if (link->controls_fd < 0 || link->pads_fd < 0) {
+    link->motion_fd = open_node(motion->path);
+    if (link->controls_fd < 0 || link->pads_fd < 0 || link->motion_fd < 0) {
         close_nodes(link);
         return false;
     }
@@ -233,6 +251,10 @@ static void close_nodes(session_sc2_link_t *link) {
         close(link->pads_fd);
         link->pads_fd = -1;
     }
+    if (link->motion_fd >= 0) {
+        close(link->motion_fd);
+        link->motion_fd = -1;
+    }
 }
 
 static int reader_main(session_sc2_link_t *link) {
@@ -241,16 +263,20 @@ static int reader_main(session_sc2_link_t *link) {
     reader.link = link;
     reader.controls.fd = link->controls_fd;
     reader.pads.fd = link->pads_fd;
+    reader.motion.fd = link->motion_fd;
     read_axis_values(&reader.controls);
     read_axis_values(&reader.pads);
+    read_axis_values(&reader.motion);
     handle_controls_frame(&reader);
     handle_pads_frame(&reader);
+    handle_motion_frame(&reader);
     while (!SDL_AtomicGet(&link->stop_requested)) {
-        struct pollfd fds[2] = {
+        struct pollfd fds[3] = {
                 {.fd = reader.controls.fd, .events = POLLIN},
                 {.fd = reader.pads.fd, .events = POLLIN},
+                {.fd = reader.motion.fd, .events = POLLIN},
         };
-        int ready = poll(fds, 2, POLL_TIMEOUT_MS);
+        int ready = poll(fds, 3, POLL_TIMEOUT_MS);
         if (ready < 0 && errno != EINTR) {
             commons_log_error("SC2Link", "poll failed: %s", strerror(errno));
             break;
@@ -259,7 +285,8 @@ static int reader_main(session_sc2_link_t *link) {
             continue;
         }
         if (!read_node(&reader, &reader.controls, fds[0].revents, handle_controls_frame) ||
-            !read_node(&reader, &reader.pads, fds[1].revents, handle_pads_frame)) {
+            !read_node(&reader, &reader.pads, fds[1].revents, handle_pads_frame) ||
+            !read_node(&reader, &reader.motion, fds[2].revents, handle_motion_frame)) {
             break;
         }
     }
@@ -358,6 +385,18 @@ static void handle_pads_frame(controller_reader_t *reader) {
     }
 }
 
+static void handle_motion_frame(controller_reader_t *reader) {
+    if (!reader->arrived || !accepting_input(reader)) {
+        return;
+    }
+    sc2_link_motion_t motion = sc2_link_decode_motion(reader->motion.axis_values);
+    uint64_t now_us = monotonic_time_us();
+    send_motion(reader, LI_MOTION_TYPE_ACCEL, &reader->acceleration_next_due_us, now_us,
+                sc2_link_acceleration(&motion));
+    send_motion(reader, LI_MOTION_TYPE_GYRO, &reader->angular_velocity_next_due_us, now_us,
+                sc2_link_angular_velocity(&motion));
+}
+
 /** The arrival also sends a neutral state, which is where sent_state starts. */
 static void send_arrival(controller_reader_t *reader) {
     short controller_number = reader->link->controller_number;
@@ -379,6 +418,35 @@ static void send_touch(controller_reader_t *reader, uint8_t pad_index, const sc2
                                 pad_index, sc2_link_pad_x(pad->x), sc2_link_pad_y(pad->y),
                                 sc2_link_pad_pressure(pad->pressure));
     *sent = *pad;
+}
+
+static void send_motion(controller_reader_t *reader, uint8_t motion_type, uint64_t *next_due_us, uint64_t now_us,
+                        sc2_link_vector_t value) {
+    uint32_t period_us = motion_period_us(reader, motion_type);
+    if (!sc2_link_motion_due(*next_due_us, now_us, period_us)) {
+        return;
+    }
+    LiSendControllerMotionEvent((uint8_t) reader->link->controller_number, motion_type, value.x, value.y, value.z);
+    *next_due_us = sc2_link_motion_next_due(*next_due_us, now_us, period_us);
+}
+
+/**
+ * The host's request for this sensor, where
+ * app_input_gamepad_set_motion_event_state() keeps it for every controller
+ * number: a period in whole milliseconds, 0 when the host asked for none. The
+ * host asks for 250 Hz, which that period holds exactly.
+ */
+static uint32_t motion_period_us(const controller_reader_t *reader, uint8_t motion_type) {
+    const app_gamepad_state_t *gamepad = &reader->link->input->input->gamepads[reader->link->controller_number];
+    const app_gamepad_sensor_state_t *request =
+            motion_type == LI_MOTION_TYPE_ACCEL ? &gamepad->accelState : &gamepad->gyroState;
+    return request->periodMs * 1000u;
+}
+
+static uint64_t monotonic_time_us(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * 1000000u + (uint64_t) now.tv_nsec / 1000u;
 }
 
 static bool accepting_input(const controller_reader_t *reader) {

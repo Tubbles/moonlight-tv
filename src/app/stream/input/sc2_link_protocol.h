@@ -31,6 +31,7 @@ typedef enum sc2_link_node_role_t {
     SC2_LINK_NODE_OTHER = 0,
     SC2_LINK_NODE_CONTROLS,
     SC2_LINK_NODE_PADS,
+    SC2_LINK_NODE_MOTION,
 } sc2_link_node_role_t;
 
 /** The controls node's values, raw as the controller sent them. */
@@ -58,6 +59,23 @@ typedef struct sc2_link_pad_t {
 typedef struct sc2_link_pads_t {
     sc2_link_pad_t pads[SC2_LINK_PAD_COUNT];
 } sc2_link_pads_t;
+
+/** The motion node's values, raw as the controller sent them. */
+typedef struct sc2_link_motion_t {
+    int16_t accelerometer_x;
+    int16_t accelerometer_y;
+    int16_t accelerometer_z;
+    int16_t gyroscope_x;
+    int16_t gyroscope_y;
+    int16_t gyroscope_z;
+} sc2_link_motion_t;
+
+/** A sensor reading as LiSendControllerMotionEvent() takes it. */
+typedef struct sc2_link_vector_t {
+    float x;
+    float y;
+    float z;
+} sc2_link_vector_t;
 
 /** A controller state as LiSendMultiControllerEvent() takes it. */
 typedef struct sc2_link_gamepad_state_t {
@@ -89,6 +107,9 @@ sc2_link_controls_t sc2_link_decode_controls(const int32_t axis_values[ABS_CNT])
 /** The pads node's state, from its last value of every ABS code. */
 sc2_link_pads_t sc2_link_decode_pads(const int32_t axis_values[ABS_CNT]);
 
+/** The motion node's state, from its last value of every ABS code. */
+sc2_link_motion_t sc2_link_decode_motion(const int32_t axis_values[ABS_CNT]);
+
 bool sc2_link_controller_connected(const sc2_link_controls_t *controls);
 
 /** Moonlight button flags for the controller's button bits. */
@@ -115,3 +136,19 @@ float sc2_link_pad_pressure(uint16_t raw);
  * sent to the current one, or SC2_LINK_NO_TOUCH_EVENT.
  */
 int sc2_link_touch_event_type(const sc2_link_pad_t *sent, const sc2_link_pad_t *current);
+
+/** Acceleration in m/s², gravity included, on SDL's sensor axes. */
+sc2_link_vector_t sc2_link_acceleration(const sc2_link_motion_t *motion);
+
+/** Angular velocity in degrees per second, on SDL's sensor axes. */
+sc2_link_vector_t sc2_link_angular_velocity(const sc2_link_motion_t *motion);
+
+/**
+ * Whether a sample read at now_us may go out to a host that asked for one
+ * sample every period_us, a period of 0 meaning none. next_due_us starts at 0
+ * and follows sc2_link_motion_next_due() after every sample sent.
+ */
+bool sc2_link_motion_due(uint64_t next_due_us, uint64_t now_us, uint32_t period_us);
+
+/** When the sample after the one sent at now_us is due. */
+uint64_t sc2_link_motion_next_due(uint64_t next_due_us, uint64_t now_us, uint32_t period_us);

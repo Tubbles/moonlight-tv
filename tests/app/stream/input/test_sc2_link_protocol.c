@@ -21,8 +21,10 @@ void test_node_role_by_interface(void) {
                       sc2_link_node_role(0x045E, 0x028E, "OpenPuck SC2 Link", DONGLE_PHYS "/input1"));
     TEST_ASSERT_EQUAL(SC2_LINK_NODE_PADS,
                       sc2_link_node_role(0x045E, 0x028E, "OpenPuck SC2 Link", DONGLE_PHYS "/input2"));
-    TEST_ASSERT_EQUAL(SC2_LINK_NODE_OTHER,
+    TEST_ASSERT_EQUAL(SC2_LINK_NODE_MOTION,
                       sc2_link_node_role(0x045E, 0x028E, "OpenPuck SC2 Link", DONGLE_PHYS "/input3"));
+    TEST_ASSERT_EQUAL(SC2_LINK_NODE_OTHER,
+                      sc2_link_node_role(0x045E, 0x028E, "OpenPuck SC2 Link", DONGLE_PHYS "/input4"));
     TEST_ASSERT_EQUAL(SC2_LINK_NODE_OTHER,
                       sc2_link_node_role(0x045E, 0x028E, "OpenPuck SC2 Link", DONGLE_PHYS "/input11"));
 }
