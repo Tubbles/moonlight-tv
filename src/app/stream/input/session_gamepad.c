@@ -59,6 +59,8 @@ static void release_buttons(stream_input_t *input, app_gamepad_state_t *gamepad)
 
 static bool gamepad_combo_check(int buttons, short combo);
 
+static bool gamepad_forwarded(const stream_input_t *input, const app_gamepad_state_t *gamepad);
+
 static bool sensor_state_needs_update(const app_gamepad_sensor_state_t *state, uint32_t timestamp,
                                       const float data[3]);
 
@@ -259,7 +261,9 @@ void stream_input_handle_cbutton(stream_input_t *input, const SDL_ControllerButt
         }
     }
 
-    if (input->view_only) {
+    // The combos above still work on an SC2 Link dongle: its xpad node mirrors the
+    // Xbox 360 subset of the Steam Controller's buttons.
+    if (input->view_only || !gamepad_forwarded(input, gamepad)) {
         return;
     }
     LiSendMultiControllerEvent(gamepad->gs_id, input->input->activeGamepadMask, gamepad->buttons, gamepad->leftTrigger,
@@ -315,9 +319,11 @@ void stream_input_handle_caxis(stream_input_t *input, const SDL_ControllerAxisEv
     if (vmouse_intercepted(input, gamepad)) {
         vmouse_set_vector(&input->vmouse, gamepad->rightStickX, gamepad->rightStickY);
         vmouse_set_trigger(&input->vmouse, gamepad->leftTrigger, gamepad->rightTrigger);
-        LiSendMultiControllerEvent(gamepad->gs_id, input->input->activeGamepadMask, gamepad->buttons, 0, 0,
-                                   gamepad->leftStickX, gamepad->leftStickY, 0, 0);
-    } else {
+        if (gamepad_forwarded(input, gamepad)) {
+            LiSendMultiControllerEvent(gamepad->gs_id, input->input->activeGamepadMask, gamepad->buttons, 0, 0,
+                                       gamepad->leftStickX, gamepad->leftStickY, 0, 0);
+        }
+    } else if (gamepad_forwarded(input, gamepad)) {
         LiSendMultiControllerEvent(gamepad->gs_id, input->input->activeGamepadMask, gamepad->buttons,
                                    gamepad->leftTrigger,
                                    gamepad->rightTrigger, gamepad->leftStickX, gamepad->leftStickY,
@@ -840,6 +846,9 @@ static void release_buttons(stream_input_t *input, app_gamepad_state_t *gamepad)
     gamepad->leftStickY = 0;
     gamepad->rightStickX = 0;
     gamepad->rightStickY = 0;
+    if (!gamepad_forwarded(input, gamepad)) {
+        return;
+    }
     LiSendMultiControllerEvent(gamepad->gs_id, input->input->activeGamepadMask, gamepad->buttons, gamepad->leftTrigger,
                                gamepad->rightTrigger, gamepad->leftStickX, gamepad->leftStickY, gamepad->rightStickX,
                                gamepad->rightStickY);
@@ -848,6 +857,16 @@ static void release_buttons(stream_input_t *input, app_gamepad_state_t *gamepad)
 
 static bool gamepad_combo_check(int buttons, short combo) {
     return (buttons & combo) == combo;
+}
+
+static bool gamepad_forwarded(const stream_input_t *input, const app_gamepad_state_t *gamepad) {
+#if FEATURE_INPUT_SC2_LINK
+    return !session_sc2_link_owns(&input->sc2_link, gamepad->gs_id);
+#else
+    (void) input;
+    (void) gamepad;
+    return true;
+#endif
 }
 
 static bool sensor_state_needs_update(const app_gamepad_sensor_state_t *state, uint32_t timestamp,

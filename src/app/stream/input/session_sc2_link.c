@@ -36,10 +36,19 @@ void session_sc2_link_init(session_sc2_link_t *link) {
 }
 
 bool session_sc2_link_take_over(session_sc2_link_t *link, const app_gamepad_state_t *gamepad) {
-    (void) link;
     if (!is_sc2_link_xpad(gamepad)) {
+        if (session_sc2_link_owns(link, gamepad->gs_id)) {
+            // The dongle was unplugged and another controller got its number.
+            session_sc2_link_stop(link);
+        }
         return false;
     }
+    if (link->controller_number >= 0 && link->controller_number != gamepad->gs_id) {
+        commons_log_warn("SC2Link", "Controller #%d is a second SC2 Link dongle, forwarded as an Xbox 360 pad",
+                         gamepad->gs_id);
+        return false;
+    }
+    session_sc2_link_stop(link);
     node_location_t controls, pads;
     if (!find_hid_nodes(&controls, &pads)) {
         commons_log_warn("SC2Link", "Controller #%d is an SC2 Link dongle, but its HID nodes were not found",
@@ -48,7 +57,12 @@ bool session_sc2_link_take_over(session_sc2_link_t *link, const app_gamepad_stat
     }
     commons_log_info("SC2Link", "Controller #%d is an SC2 Link dongle: controls %s, pads %s", gamepad->gs_id,
                      controls.path, pads.path);
-    return false;
+    link->controller_number = gamepad->gs_id;
+    return true;
+}
+
+bool session_sc2_link_owns(const session_sc2_link_t *link, short controller_number) {
+    return link->controller_number >= 0 && link->controller_number == controller_number;
 }
 
 void session_sc2_link_stop(session_sc2_link_t *link) {

@@ -11,6 +11,7 @@ typedef struct app_gamepad_state_t app_gamepad_state_t;
  * nodes, which carry the full controller state.
  */
 typedef struct session_sc2_link_t {
+    // Controller number of the xpad node whose slot the dongle took, -1 for none.
     short controller_number;
 } session_sc2_link_t;
 
@@ -23,5 +24,8 @@ void session_sc2_link_init(session_sc2_link_t *link);
  * @return true when the dongle takes over this controller's slot.
  */
 bool session_sc2_link_take_over(session_sc2_link_t *link, const app_gamepad_state_t *gamepad);
+
+/** Whether the dongle holds this controller number, so its SDL controller must not be forwarded. */
+bool session_sc2_link_owns(const session_sc2_link_t *link, short controller_number);
 
 void session_sc2_link_stop(session_sc2_link_t *link);
