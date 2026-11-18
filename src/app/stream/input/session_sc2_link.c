@@ -92,6 +92,8 @@ static void handle_motion_frame(controller_reader_t *reader);
 
 static void send_arrival(controller_reader_t *reader);
 
+static void send_removal(controller_reader_t *reader);
+
 static void send_touch(controller_reader_t *reader, uint8_t pad_index, const sc2_link_pad_t *pad);
 
 static void send_battery(controller_reader_t *reader, uint16_t status);
@@ -358,14 +360,19 @@ static void read_axis_values(node_reader_t *node) {
 
 static void handle_controls_frame(controller_reader_t *reader) {
     sc2_link_controls_t controls = sc2_link_decode_controls(reader->controls.axis_values);
+    if (!sc2_link_controller_connected(&controls)) {
+        // A removal is no input, so it also goes out while the overlay blocks
+        // input: the dongle sends no later frame that could carry it.
+        if (reader->arrived) {
+            send_removal(reader);
+        }
+        // Nothing else: any state sent before the arrival makes the host create its default pad for this number.
+        return;
+    }
     if (!accepting_input(reader)) {
         return;
     }
     if (!reader->arrived) {
-        // Any state sent before the arrival makes the host create its default pad for this number.
-        if (!sc2_link_controller_connected(&controls)) {
-            return;
-        }
         send_arrival(reader);
     }
     send_battery(reader, controls.status);
@@ -402,8 +409,8 @@ static void handle_motion_frame(controller_reader_t *reader) {
 }
 
 /**
- * The arrival also sends a neutral state, which is where sent_state starts,
- * and the host knows no battery yet.
+ * The host makes a new controller for every arrival, which starts with the
+ * neutral state the arrival also sends, no touch and no battery.
  */
 static void send_arrival(controller_reader_t *reader) {
     short controller_number = reader->link->controller_number;
@@ -412,7 +419,23 @@ static void send_arrival(controller_reader_t *reader) {
     LiSendControllerArrivalEvent((uint8_t) controller_number, (uint16_t) active_gamepad_mask, LI_CTYPE_STEAM,
                                  sc2_link_supported_button_flags(), ARRIVAL_CAPABILITIES);
     reader->arrived = true;
+    memset(&reader->sent_state, 0, sizeof(reader->sent_state));
+    memset(&reader->sent_pads, 0, sizeof(reader->sent_pads));
     reader->sent_battery = sc2_link_unknown_battery();
+}
+
+/**
+ * An empty state without the controller's bit in the active gamepad mask
+ * makes the host free it. The app's own mask keeps the bit, since the
+ * dongle's xpad node still holds this controller number.
+ */
+static void send_removal(controller_reader_t *reader) {
+    short controller_number = reader->link->controller_number;
+    short active_gamepad_mask =
+            (short) (app_input_gamepads_mask(reader->link->input->input) & ~(1 << controller_number));
+    commons_log_info("SC2Link", "Steam Controller #%d disconnected", controller_number);
+    LiSendMultiControllerEvent(controller_number, active_gamepad_mask, 0, 0, 0, 0, 0, 0, 0);
+    reader->arrived = false;
 }
 
 static void send_touch(controller_reader_t *reader, uint8_t pad_index, const sc2_link_pad_t *pad) {
