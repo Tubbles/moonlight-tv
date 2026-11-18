@@ -9,10 +9,20 @@
 #define MOTION_INTERFACE_SUFFIX "/input3"
 
 #define STATUS_CONNECTED 0x0001
+#define STATUS_CHARGE_STATE_SHIFT 1
+#define STATUS_CHARGE_STATE_MASK 0x7u
+#define STATUS_BATTERY_PERCENT_SHIFT 4
+#define STATUS_BATTERY_PERCENT_MASK 0x7Fu
+#define STATUS_BATTERY_KNOWN 0x0800
 #define PADS_LEFT_TOUCHED 0x0001
 #define PADS_RIGHT_TOUCHED 0x0002
 
 #define TRIGGER_FULL_SCALE 32767u
+
+// EChargeState of SDL's src/joystick/hidapi/steam/controller_structs.h.
+#define CHARGE_STATE_DISCHARGING 1
+#define CHARGE_STATE_CHARGING 2
+#define CHARGE_STATE_CHARGING_DONE 4
 
 // Full scales of the raw IMU mode, which the dongle forces, as SDL's triton driver reads them.
 #define SENSOR_RAW_FULL_SCALE 32768.0f
@@ -71,6 +81,8 @@ static sc2_link_pad_t decode_pad(const int32_t axis_values[ABS_CNT], int x_code,
                                  bool touched);
 
 static sc2_link_vector_t sdl_sensor_axes(int16_t raw_x, int16_t raw_y, int16_t raw_z, float full_scale);
+
+static uint8_t moonlight_battery_state(unsigned int charge_state);
 
 sc2_link_node_role_t sc2_link_node_role(uint16_t vendor, uint16_t product, const char *name, const char *phys) {
     if (vendor != SC2_LINK_VENDOR_ID || product != SC2_LINK_PRODUCT_ID ||
@@ -147,6 +159,29 @@ sc2_link_motion_t sc2_link_decode_motion(const int32_t axis_values[ABS_CNT]) {
 
 bool sc2_link_controller_connected(const sc2_link_controls_t *controls) {
     return (controls->status & STATUS_CONNECTED) != 0;
+}
+
+sc2_link_battery_t sc2_link_battery(uint16_t status) {
+    if ((status & STATUS_BATTERY_KNOWN) == 0) {
+        return sc2_link_unknown_battery();
+    }
+    sc2_link_battery_t battery = {
+            .state = moonlight_battery_state((status >> STATUS_CHARGE_STATE_SHIFT) & STATUS_CHARGE_STATE_MASK),
+            .percentage = (uint8_t) ((status >> STATUS_BATTERY_PERCENT_SHIFT) & STATUS_BATTERY_PERCENT_MASK),
+    };
+    return battery;
+}
+
+sc2_link_battery_t sc2_link_unknown_battery(void) {
+    sc2_link_battery_t battery = {
+            .state = LI_BATTERY_STATE_UNKNOWN,
+            .percentage = LI_BATTERY_PERCENTAGE_UNKNOWN,
+    };
+    return battery;
+}
+
+bool sc2_link_battery_equal(const sc2_link_battery_t *battery, const sc2_link_battery_t *other) {
+    return battery->state == other->state && battery->percentage == other->percentage;
 }
 
 int sc2_link_moonlight_buttons(uint32_t buttons) {
@@ -285,6 +320,26 @@ static sc2_link_vector_t sdl_sensor_axes(int16_t raw_x, int16_t raw_y, int16_t r
             .z = -(float) raw_y / SENSOR_RAW_FULL_SCALE * full_scale,
     };
     return vector;
+}
+
+/*
+ * The charge states that SDL's triton driver tells apart
+ * (HIDAPI_DriverSteamTriton_HandleBatteryStatus()), which are also the ones
+ * libvirtualhid writes back from Moonlight's. Reset and source validation are
+ * unknown to both, and Sunshine drops the battery of a controller whose state
+ * is unknown.
+ */
+static uint8_t moonlight_battery_state(unsigned int charge_state) {
+    switch (charge_state) {
+        case CHARGE_STATE_DISCHARGING:
+            return LI_BATTERY_STATE_DISCHARGING;
+        case CHARGE_STATE_CHARGING:
+            return LI_BATTERY_STATE_CHARGING;
+        case CHARGE_STATE_CHARGING_DONE:
+            return LI_BATTERY_STATE_FULL;
+        default:
+            return LI_BATTERY_STATE_UNKNOWN;
+    }
 }
 
 static bool ends_with(const char *text, const char *suffix) {

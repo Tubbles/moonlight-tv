@@ -28,9 +28,9 @@
 #define POLL_TIMEOUT_MS 50
 #define EVENT_BATCH_SIZE 64
 
-// No battery or haptics yet: nothing reads or plays them.
+// No haptics yet: nothing plays them.
 #define ARRIVAL_CAPABILITIES (LI_CCAP_ANALOG_TRIGGERS | LI_CCAP_TOUCHPAD | LI_CCAP_DUAL_TOUCHPAD | LI_CCAP_ACCEL | \
-                              LI_CCAP_GYRO)
+                              LI_CCAP_GYRO | LI_CCAP_BATTERY_STATE)
 
 typedef struct node_location_t {
     char path[NODE_PATH_MAX];
@@ -53,6 +53,7 @@ typedef struct controller_reader_t {
     // What the host was last sent, so only changes go out.
     sc2_link_gamepad_state_t sent_state;
     sc2_link_pads_t sent_pads;
+    sc2_link_battery_t sent_battery;
     // See sc2_link_motion_due().
     uint64_t acceleration_next_due_us;
     uint64_t angular_velocity_next_due_us;
@@ -92,6 +93,8 @@ static void handle_motion_frame(controller_reader_t *reader);
 static void send_arrival(controller_reader_t *reader);
 
 static void send_touch(controller_reader_t *reader, uint8_t pad_index, const sc2_link_pad_t *pad);
+
+static void send_battery(controller_reader_t *reader, uint16_t status);
 
 static void send_motion(controller_reader_t *reader, uint8_t motion_type, uint64_t *next_due_us, uint64_t now_us,
                         sc2_link_vector_t value);
@@ -365,6 +368,7 @@ static void handle_controls_frame(controller_reader_t *reader) {
         }
         send_arrival(reader);
     }
+    send_battery(reader, controls.status);
     sc2_link_gamepad_state_t state = sc2_link_gamepad_state(&controls);
     if (sc2_link_gamepad_state_equal(&state, &reader->sent_state)) {
         return;
@@ -397,7 +401,10 @@ static void handle_motion_frame(controller_reader_t *reader) {
                 sc2_link_angular_velocity(&motion));
 }
 
-/** The arrival also sends a neutral state, which is where sent_state starts. */
+/**
+ * The arrival also sends a neutral state, which is where sent_state starts,
+ * and the host knows no battery yet.
+ */
 static void send_arrival(controller_reader_t *reader) {
     short controller_number = reader->link->controller_number;
     short active_gamepad_mask = app_input_gamepads_mask(reader->link->input->input);
@@ -405,6 +412,7 @@ static void send_arrival(controller_reader_t *reader) {
     LiSendControllerArrivalEvent((uint8_t) controller_number, (uint16_t) active_gamepad_mask, LI_CTYPE_STEAM,
                                  sc2_link_supported_button_flags(), ARRIVAL_CAPABILITIES);
     reader->arrived = true;
+    reader->sent_battery = sc2_link_unknown_battery();
 }
 
 static void send_touch(controller_reader_t *reader, uint8_t pad_index, const sc2_link_pad_t *pad) {
@@ -418,6 +426,15 @@ static void send_touch(controller_reader_t *reader, uint8_t pad_index, const sc2
                                 pad_index, sc2_link_pad_x(pad->x), sc2_link_pad_y(pad->y),
                                 sc2_link_pad_pressure(pad->pressure));
     *sent = *pad;
+}
+
+static void send_battery(controller_reader_t *reader, uint16_t status) {
+    sc2_link_battery_t battery = sc2_link_battery(status);
+    if (sc2_link_battery_equal(&battery, &reader->sent_battery)) {
+        return;
+    }
+    LiSendControllerBatteryEvent((uint8_t) reader->link->controller_number, battery.state, battery.percentage);
+    reader->sent_battery = battery;
 }
 
 static void send_motion(controller_reader_t *reader, uint8_t motion_type, uint64_t *next_due_us, uint64_t now_us,

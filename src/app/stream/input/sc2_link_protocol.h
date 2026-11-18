@@ -44,7 +44,7 @@ typedef struct sc2_link_controls_t {
     int16_t right_stick_y;
     uint16_t left_trigger;
     uint16_t right_trigger;
-    // Bit 0 controller connected, then charge state and battery, unused here.
+    // Bit 0 controller connected, bits 1 to 3 charge state, 4 to 10 battery percent, 11 battery known.
     uint16_t status;
 } sc2_link_controls_t;
 
@@ -76,6 +76,14 @@ typedef struct sc2_link_vector_t {
     float y;
     float z;
 } sc2_link_vector_t;
+
+/** A battery as LiSendControllerBatteryEvent() takes it. */
+typedef struct sc2_link_battery_t {
+    // LI_BATTERY_STATE_*
+    uint8_t state;
+    // The controller's percent, or LI_BATTERY_PERCENTAGE_UNKNOWN.
+    uint8_t percentage;
+} sc2_link_battery_t;
 
 /** A controller state as LiSendMultiControllerEvent() takes it. */
 typedef struct sc2_link_gamepad_state_t {
@@ -111,6 +119,14 @@ sc2_link_pads_t sc2_link_decode_pads(const int32_t axis_values[ABS_CNT]);
 sc2_link_motion_t sc2_link_decode_motion(const int32_t axis_values[ABS_CNT]);
 
 bool sc2_link_controller_connected(const sc2_link_controls_t *controls);
+
+/** The battery from the controls node's status. */
+sc2_link_battery_t sc2_link_battery(uint16_t status);
+
+/** A battery the controller has not reported yet, which is also where the host starts. */
+sc2_link_battery_t sc2_link_unknown_battery(void);
+
+bool sc2_link_battery_equal(const sc2_link_battery_t *battery, const sc2_link_battery_t *other);
 
 /** Moonlight button flags for the controller's button bits. */
 int sc2_link_moonlight_buttons(uint32_t buttons);
