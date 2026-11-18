@@ -6,13 +6,15 @@
 
 typedef struct app_gamepad_state_t app_gamepad_state_t;
 typedef struct stream_input_t stream_input_t;
+typedef struct sc2_link_writer_t sc2_link_writer_t;
 
 /**
  * A Steam Controller (2nd generation) behind an OpenPuck dongle in SC2 Link mode.
  *
  * SDL opens the dongle's xpad node as an Xbox 360 pad and cannot open its HID
  * nodes, which carry the full controller state. A reader thread sends that
- * state to the host as a Steam Controller.
+ * state to the host as a Steam Controller, and a writer thread plays the
+ * host's rumble and haptics through the xpad node.
  */
 typedef struct session_sc2_link_t {
     stream_input_t *input;
@@ -21,6 +23,8 @@ typedef struct session_sc2_link_t {
     int controls_fd;
     int pads_fd;
     int motion_fd;
+    // NULL while no reader runs, or when the xpad node was not found or the thread did not start.
+    sc2_link_writer_t *writer;
     // Controller number of the xpad node whose slot the dongle took, -1 for none.
     short controller_number;
 } session_sc2_link_t;

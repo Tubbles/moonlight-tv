@@ -85,6 +85,16 @@ void test_xpad_needs_the_mode_version(void) {
     TEST_ASSERT_FALSE(sc2_link_is_xpad(0x045E, 0x02EA, 0x5C21));
 }
 
+/* usbhid gives the HID nodes the HID version, so only interface 0 carries the mode's. */
+void test_xpad_node_is_interface_0_with_the_mode_version(void) {
+    TEST_ASSERT_TRUE(sc2_link_is_xpad_node(0x045E, 0x028E, 0x5C21, DONGLE_PHYS "/input0"));
+    TEST_ASSERT_FALSE(sc2_link_is_xpad_node(0x045E, 0x028E, 0x0111, DONGLE_PHYS "/input0"));
+    TEST_ASSERT_FALSE(sc2_link_is_xpad_node(0x045E, 0x028E, 0x0114, DONGLE_PHYS "/input0"));
+    TEST_ASSERT_FALSE(sc2_link_is_xpad_node(0x045E, 0x028E, 0x5C21, DONGLE_PHYS "/input1"));
+    TEST_ASSERT_FALSE(sc2_link_is_xpad_node(0x045E, 0x028E, 0x5C21, DONGLE_PHYS "/input10"));
+    TEST_ASSERT_FALSE(sc2_link_is_xpad_node(0x045E, 0x028E, 0x5C21, ""));
+}
+
 void test_decode_controls_keeps_bit_patterns(void) {
     axis_values[ABS_MISC] = 1234;
     axis_values[ABS_THROTTLE] = (int16_t) 0x8001;
@@ -499,6 +509,7 @@ int main() {
     RUN_TEST(test_node_role_rejects_other_devices);
     RUN_TEST(test_same_dongle_compares_phys_before_interface);
     RUN_TEST(test_xpad_needs_the_mode_version);
+    RUN_TEST(test_xpad_node_is_interface_0_with_the_mode_version);
     RUN_TEST(test_decode_controls_keeps_bit_patterns);
     RUN_TEST(test_decode_pads);
     RUN_TEST(test_every_button_bit_maps_to_its_flag);

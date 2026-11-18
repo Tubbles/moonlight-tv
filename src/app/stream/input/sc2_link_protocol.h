@@ -32,6 +32,8 @@ typedef enum sc2_link_node_role_t {
     SC2_LINK_NODE_CONTROLS,
     SC2_LINK_NODE_PADS,
     SC2_LINK_NODE_MOTION,
+    // Interface 0, which carries the word protocol out to the dongle.
+    SC2_LINK_NODE_XPAD,
 } sc2_link_node_role_t;
 
 /** The controls node's values, raw as the controller sent them. */
@@ -108,6 +110,9 @@ bool sc2_link_same_dongle(const char *phys, const char *other_phys);
 
 /** Whether a controller with this vendor, product and version is the dongle's xpad node. */
 bool sc2_link_is_xpad(uint16_t vendor, uint16_t product, uint16_t version);
+
+/** Whether an evdev node is the dongle's xpad node, from its EVIOCGID and its phys string. */
+bool sc2_link_is_xpad_node(uint16_t vendor, uint16_t product, uint16_t version, const char *phys);
 
 /** The controls node's state, from its last value of every ABS code. */
 sc2_link_controls_t sc2_link_decode_controls(const int32_t axis_values[ABS_CNT]);

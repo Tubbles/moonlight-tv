@@ -1,4 +1,5 @@
 #include "session_sc2_link.h"
+#include "session_sc2_link_writer.h"
 #include "session_input.h"
 #include "sc2_link_protocol.h"
 
@@ -46,9 +47,12 @@ typedef struct node_reader_t {
 
 typedef struct controller_reader_t {
     session_sc2_link_t *link;
+    // Gets the acknowledgements from the pads node. NULL without output.
+    sc2_link_writer_t *writer;
     node_reader_t controls;
     node_reader_t pads;
     node_reader_t motion;
+    bool output_wanted;
     bool arrived;
     // At the last controls frame of a connected controller.
     bool input_accepted;
@@ -73,6 +77,8 @@ static sc2_link_node_role_t node_role(int fd, char phys[NODE_TEXT_MAX]);
 
 static bool start_reader(session_sc2_link_t *link, short controller_number, const node_location_t *controls,
                          const node_location_t *pads, const node_location_t *motion);
+
+static void start_writer(session_sc2_link_t *link, const node_location_t *controls);
 
 static int open_node(const char *path);
 
@@ -116,6 +122,7 @@ void session_sc2_link_init(session_sc2_link_t *link, stream_input_t *input) {
     link->controls_fd = -1;
     link->pads_fd = -1;
     link->motion_fd = -1;
+    link->writer = NULL;
     link->controller_number = -1;
 }
 
@@ -149,10 +156,18 @@ bool session_sc2_link_owns(const session_sc2_link_t *link, short controller_numb
 }
 
 void session_sc2_link_stop(session_sc2_link_t *link) {
+    if (link->writer != NULL) {
+        // First, as the reader passes on the acknowledgements that the writer's last words wait for.
+        sc2_link_writer_stop(link->writer);
+    }
     if (link->thread != NULL) {
         SDL_AtomicSet(&link->stop_requested, 1);
         SDL_WaitThread(link->thread, NULL);
         link->thread = NULL;
+    }
+    if (link->writer != NULL) {
+        sc2_link_writer_destroy(link->writer);
+        link->writer = NULL;
     }
     close_nodes(link);
     link->controller_number = -1;
@@ -210,6 +225,9 @@ static sc2_link_node_role_t node_role(int fd, char phys[NODE_TEXT_MAX]) {
         ioctl(fd, EVIOCGPHYS(NODE_TEXT_MAX - 1), phys) < 0) {
         return SC2_LINK_NODE_OTHER;
     }
+    if (sc2_link_is_xpad_node(id.vendor, id.product, id.version, phys)) {
+        return SC2_LINK_NODE_XPAD;
+    }
     return sc2_link_node_role(id.vendor, id.product, name, phys);
 }
 
@@ -222,17 +240,28 @@ static bool start_reader(session_sc2_link_t *link, short controller_number, cons
         close_nodes(link);
         return false;
     }
-    // Set before the thread starts, which reads it.
+    // Set before the thread starts, which reads them.
     link->controller_number = controller_number;
+    start_writer(link, controls);
     SDL_AtomicSet(&link->stop_requested, 0);
     link->thread = SDL_CreateThread((SDL_ThreadFunction) reader_main, "sc2link", link);
     if (link->thread == NULL) {
         commons_log_error("SC2Link", "Can't start the reader: %s", SDL_GetError());
-        close_nodes(link);
-        link->controller_number = -1;
+        session_sc2_link_stop(link);
         return false;
     }
     return true;
+}
+
+/* Without a writer the controller works as before, only without rumble and haptics. */
+static void start_writer(session_sc2_link_t *link, const node_location_t *controls) {
+    node_location_t xpad;
+    if (!find_node(SC2_LINK_NODE_XPAD, controls->phys, &xpad)) {
+        commons_log_warn("SC2Link", "The dongle's xpad node was not found, so the controller gets no rumble or "
+                                    "haptics");
+        return;
+    }
+    link->writer = sc2_link_writer_start(xpad.path, link->pads_fd);
 }
 
 /** Grabbed, so nothing else on the TV acts on the node while the stream reads it. */
@@ -268,6 +297,7 @@ static int reader_main(session_sc2_link_t *link) {
     controller_reader_t reader;
     memset(&reader, 0, sizeof(reader));
     reader.link = link;
+    reader.writer = link->writer;
     reader.controls.fd = link->controls_fd;
     reader.pads.fd = link->pads_fd;
     reader.motion.fd = link->motion_fd;
@@ -371,6 +401,10 @@ static void handle_controls_frame(controller_reader_t *reader) {
         // Nothing else: any state sent before the arrival makes the host create its default pad for this number.
         return;
     }
+    if (!reader->output_wanted && reader->writer != NULL) {
+        sc2_link_writer_want_output(reader->writer);
+        reader->output_wanted = true;
+    }
     // Checked here rather than on motion frames: the sample counter gives the
     // controls node a frame for every state, a still controller included.
     bool input_accepted = accepting_input(reader);
@@ -398,6 +432,10 @@ static void handle_controls_frame(controller_reader_t *reader) {
 }
 
 static void handle_pads_frame(controller_reader_t *reader) {
+    if (reader->writer != NULL) {
+        sc2_link_writer_note_acknowledgement(reader->writer, (uint16_t) reader->pads.axis_values[ABS_GAS],
+                                             (uint16_t) reader->pads.axis_values[ABS_BRAKE]);
+    }
     if (!reader->arrived || !accepting_input(reader)) {
         return;
     }

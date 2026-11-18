@@ -31,6 +31,26 @@
 
 #define MICROSECONDS_PER_MILLISECOND 1000
 
+#define STATE_COUNT_SHIFT 8
+#define STATE_SESSION_BIT 0x0080u
+#define STATE_EXPECTED_SHIFT 4
+#define STATE_EXPECTED_MASK 0x7u
+#define STATE_VERSION_MASK 0xFu
+// A count further ahead than this is an older one.
+#define STATE_ADVANCE_MAX 127u
+
+// A message whose session got lost goes out once more in a new one.
+#define DELIVERY_ATTEMPTS 2
+
+typedef enum words_result_t {
+    WORDS_DELIVERED,
+    // The session ended under the message, or another client's word turned up.
+    WORDS_LOST,
+    // A word stayed without acknowledgement in a session that is still open.
+    WORDS_UNACKNOWLEDGED,
+    WORDS_FAILED,
+} words_result_t;
+
 /*
  * Each is an undefined CONTROL header, so no message starts with one. Their
  * toggle is 0, so the first word of a session carries 1.
@@ -48,6 +68,15 @@ static unsigned int high_bit(uint16_t value, unsigned int at);
 static uint16_t low_bits(uint16_t value);
 
 static uint16_t clamp_to_word(int64_t value);
+
+static uint8_t count_advance(uint16_t state_before, uint16_t state);
+
+static void queue_remove(sc2_link_message_queue_t *queue, uint8_t index);
+
+static words_result_t send_words(sc2_link_client_t *client, const sc2_link_transport_t *transport,
+                                 const sc2_link_message_t *message);
+
+static bool is_bye(const sc2_link_message_t *message);
 
 sc2_link_message_t sc2_link_command_message(uint8_t side, uint8_t command, int8_t gain_db) {
     uint16_t data_words[] = {
@@ -181,6 +210,142 @@ uint8_t sc2_link_stamp_message(const sc2_link_message_t *message, uint8_t toggle
     return toggle;
 }
 
+/* xpad sends the high bytes of the magnitudes that ff-memless scaled by the gain. */
+uint16_t sc2_link_strong_magnitude(uint16_t word) {
+    return (uint16_t) (word & 0xFF00u);
+}
+
+uint16_t sc2_link_weak_magnitude(uint16_t word) {
+    return (uint16_t) ((word & 0x00FFu) << 8);
+}
+
+uint8_t sc2_link_accepted_count(uint16_t state) {
+    return (uint8_t) (state >> STATE_COUNT_SHIFT);
+}
+
+bool sc2_link_session_active(uint16_t state) {
+    return (state & STATE_SESSION_BIT) != 0;
+}
+
+uint8_t sc2_link_expected_words(uint16_t state) {
+    return (uint8_t) ((state >> STATE_EXPECTED_SHIFT) & STATE_EXPECTED_MASK);
+}
+
+uint8_t sc2_link_protocol_version(uint16_t state) {
+    return (uint8_t) (state & STATE_VERSION_MASK);
+}
+
+bool sc2_link_state_advanced(uint16_t state_before, uint16_t state) {
+    uint8_t advance = count_advance(state_before, state);
+    return advance != 0 && advance <= STATE_ADVANCE_MAX;
+}
+
+bool sc2_link_word_acknowledged(const sc2_link_acknowledgement_t *acknowledgement, uint16_t word) {
+    return count_advance(acknowledgement->state_before, acknowledgement->state) == 1 && acknowledgement->echo == word;
+}
+
+bool sc2_link_hello_needs_silence(uint16_t state) {
+    return sc2_link_session_active(state) || sc2_link_expected_words(state) != 0;
+}
+
+/* With one RUMBLE at most in the queue, the oldest other message is the first or the second. */
+void sc2_link_queue_push(sc2_link_message_queue_t *queue, const sc2_link_message_t *message) {
+    if (message->rumble) {
+        for (uint8_t index = 0; index < queue->count; index++) {
+            if (queue->messages[index].rumble) {
+                queue->messages[index] = *message;
+                return;
+            }
+        }
+    }
+    if (queue->count == SC2_LINK_MESSAGE_QUEUE_CAPACITY) {
+        queue_remove(queue, queue->messages[0].rumble ? 1 : 0);
+    }
+    queue->messages[queue->count++] = *message;
+}
+
+bool sc2_link_queue_pop(sc2_link_message_queue_t *queue, sc2_link_message_t *message) {
+    if (queue->count == 0) {
+        return false;
+    }
+    *message = queue->messages[0];
+    queue_remove(queue, 0);
+    return true;
+}
+
+/*
+ * The client of docs/PROTOCOL.md, section 9.5.1, as sc2link_test.py's Client
+ * keeps a session. One difference: a word acknowledged with another echo or
+ * count, from another FF client on the node, starts the message over instead
+ * of ending it, as the protocol asks.
+ */
+sc2_link_client_result_t sc2_link_client_hello(sc2_link_client_t *client, const sc2_link_transport_t *transport) {
+    client->in_session = false;
+    if (transport->stopping(transport->context)) {
+        return SC2_LINK_CLIENT_STOPPED;
+    }
+    uint16_t state;
+    if (!transport->read_state(transport->context, &state)) {
+        return SC2_LINK_CLIENT_FAILED;
+    }
+    if (sc2_link_hello_needs_silence(state) && !transport->wait_silence(transport->context, SC2_LINK_SILENCE_MS)) {
+        return SC2_LINK_CLIENT_STOPPED;
+    }
+    sc2_link_acknowledgement_t acknowledgement;
+    for (int index = 0; index < SC2_LINK_HELLO_WORD_COUNT; index++) {
+        uint16_t word = sc2_link_hello_words[index];
+        if (transport->send_word(transport->context, word, false, &acknowledgement) != SC2_LINK_WORD_ACKNOWLEDGED ||
+            !sc2_link_word_acknowledged(&acknowledgement, word)) {
+            return SC2_LINK_CLIENT_FAILED;
+        }
+    }
+    if (!sc2_link_session_active(acknowledgement.state) ||
+        sc2_link_protocol_version(acknowledgement.state) != SC2_LINK_PROTOCOL_VERSION) {
+        return SC2_LINK_CLIENT_FAILED;
+    }
+    client->in_session = true;
+    client->toggle = sc2_link_word_toggle(sc2_link_hello_words[SC2_LINK_HELLO_WORD_COUNT - 1]);
+    return SC2_LINK_CLIENT_DELIVERED;
+}
+
+sc2_link_client_result_t sc2_link_client_deliver(sc2_link_client_t *client, const sc2_link_transport_t *transport,
+                                                 const sc2_link_message_t *message) {
+    for (int attempt = 0; attempt < DELIVERY_ATTEMPTS; attempt++) {
+        uint16_t state;
+        if (!transport->read_state(transport->context, &state)) {
+            return SC2_LINK_CLIENT_FAILED;
+        }
+        if (!client->in_session || !sc2_link_session_active(state)) {
+            sc2_link_client_result_t result = sc2_link_client_hello(client, transport);
+            if (result != SC2_LINK_CLIENT_DELIVERED) {
+                return result;
+            }
+        }
+        words_result_t result = send_words(client, transport, message);
+        if (result == WORDS_DELIVERED) {
+            return SC2_LINK_CLIENT_DELIVERED;
+        }
+        client->in_session = false;
+        if (result == WORDS_FAILED) {
+            return SC2_LINK_CLIENT_FAILED;
+        }
+        if (result == WORDS_UNACKNOWLEDGED) {
+            // No further word until the session timed out, which the next HELLO waits for.
+            return SC2_LINK_CLIENT_DROPPED;
+        }
+    }
+    return SC2_LINK_CLIENT_DROPPED;
+}
+
+void sc2_link_client_bye(sc2_link_client_t *client, const sc2_link_transport_t *transport) {
+    uint16_t state;
+    if (client->in_session && transport->read_state(transport->context, &state) && sc2_link_session_active(state)) {
+        sc2_link_message_t bye = sc2_link_bye_message();
+        send_words(client, transport, &bye);
+    }
+    client->in_session = false;
+}
+
 static sc2_link_message_t message_of(const uint16_t *data_words, uint8_t word_count, bool rumble) {
     sc2_link_message_t message;
     memset(&message, 0, sizeof(message));
@@ -213,4 +378,48 @@ static uint16_t clamp_to_word(int64_t value) {
         return 0;
     }
     return value > UINT16_MAX ? UINT16_MAX : (uint16_t) value;
+}
+
+static uint8_t count_advance(uint16_t state_before, uint16_t state) {
+    return (uint8_t) (sc2_link_accepted_count(state) - sc2_link_accepted_count(state_before));
+}
+
+static void queue_remove(sc2_link_message_queue_t *queue, uint8_t index) {
+    memmove(&queue->messages[index], &queue->messages[index + 1],
+            (size_t) (queue->count - index - 1) * sizeof(queue->messages[0]));
+    queue->count--;
+}
+
+/*
+ * A session that ended shows in an acknowledgement without the session bit,
+ * after BYE as expected, after any other word because the dongle rejected it.
+ */
+static words_result_t send_words(sc2_link_client_t *client, const sc2_link_transport_t *transport,
+                                 const sc2_link_message_t *message) {
+    uint16_t words[SC2_LINK_MESSAGE_WORDS_MAX];
+    sc2_link_stamp_message(message, client->toggle, words);
+    for (uint8_t index = 0; index < message->word_count; index++) {
+        sc2_link_acknowledgement_t acknowledgement;
+        sc2_link_word_result_t result = transport->send_word(transport->context, words[index], true,
+                                                             &acknowledgement);
+        if (result == SC2_LINK_WORD_FAILED) {
+            return WORDS_FAILED;
+        }
+        if (result == SC2_LINK_WORD_UNACKNOWLEDGED) {
+            return sc2_link_session_active(acknowledgement.state) ? WORDS_UNACKNOWLEDGED : WORDS_LOST;
+        }
+        if (!sc2_link_word_acknowledged(&acknowledgement, words[index])) {
+            return WORDS_LOST;
+        }
+        client->toggle = sc2_link_word_toggle(words[index]);
+        if (!sc2_link_session_active(acknowledgement.state) && !is_bye(message)) {
+            return WORDS_LOST;
+        }
+    }
+    return WORDS_DELIVERED;
+}
+
+/* Compared as a whole message, since a payload word can hold the same bits. */
+static bool is_bye(const sc2_link_message_t *message) {
+    return message->word_count == 1 && message->data_words[0] == sc2_link_bye_message().data_words[0];
 }

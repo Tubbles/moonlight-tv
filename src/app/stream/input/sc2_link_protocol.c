@@ -4,6 +4,8 @@
 
 #include <Limelight.h>
 
+// xpad names its node after its own table, so the interface tells it apart.
+#define XPAD_INTERFACE_SUFFIX "/input0"
 #define CONTROLS_INTERFACE_SUFFIX "/input1"
 #define PADS_INTERFACE_SUFFIX "/input2"
 #define MOTION_INTERFACE_SUFFIX "/input3"
@@ -113,6 +115,10 @@ bool sc2_link_same_dongle(const char *phys, const char *other_phys) {
 
 bool sc2_link_is_xpad(uint16_t vendor, uint16_t product, uint16_t version) {
     return vendor == SC2_LINK_VENDOR_ID && product == SC2_LINK_PRODUCT_ID && version == SC2_LINK_XPAD_VERSION;
+}
+
+bool sc2_link_is_xpad_node(uint16_t vendor, uint16_t product, uint16_t version, const char *phys) {
+    return sc2_link_is_xpad(vendor, product, version) && ends_with(phys, XPAD_INTERFACE_SUFFIX);
 }
 
 /*

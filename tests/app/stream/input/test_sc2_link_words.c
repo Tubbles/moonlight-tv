@@ -152,6 +152,223 @@ static size_t build_report(uint16_t header, const uint16_t *payload, uint8_t rep
     }
 }
 
+/* What the dongle does with each word, its timeouts and knock aside: the Model of sc2link_test.py. */
+typedef struct dongle_model_t {
+    uint8_t counter;
+    bool active;
+    int hello;
+    uint16_t header;
+    uint16_t payload[4];
+    int have;
+    int need;
+    uint8_t toggle;
+    // The word that ended the last session, until another word arrives.
+    bool ended;
+    uint16_t end_word;
+    uint16_t echo;
+    uint8_t queued[REPORT_LENGTH_MAX];
+    size_t queued_length;
+} dongle_model_t;
+
+typedef struct model_outcome_t {
+    bool accepted;
+    bool copy;
+} model_outcome_t;
+
+static uint16_t model_state(const dongle_model_t *model) {
+    int expected = model->active ? model->need : (model->hello ? SC2_LINK_HELLO_WORD_COUNT - model->hello : 0);
+    return (uint16_t) (model->counter << 8 | (model->active ? 0x80 : 0) | (expected & 7) << 4 | 1);
+}
+
+static void model_end_session(dongle_model_t *model) {
+    model->active = false;
+    model->need = 0;
+}
+
+static model_outcome_t model_accept(dongle_model_t *model, uint16_t echo) {
+    model->counter++;
+    model->echo = echo;
+    return (model_outcome_t) {.accepted = true};
+}
+
+static bool model_hello_step(dongle_model_t *model, uint16_t word) {
+    if (word != sc2_link_hello_words[model->hello]) {
+        model->hello = 0;
+    }
+    if (word != sc2_link_hello_words[model->hello]) {
+        return false;
+    }
+    model->hello++;
+    return true;
+}
+
+static bool model_copy(const dongle_model_t *model, uint16_t word) {
+    if (model->active) {
+        return word >> 15 == model->toggle;
+    }
+    if (model->ended && word == model->end_word) {
+        return true;
+    }
+    return model->hello && word == sc2_link_hello_words[model->hello - 1];
+}
+
+static model_outcome_t model_reject(dongle_model_t *model, uint16_t word) {
+    model_end_session(model);
+    model_hello_step(model, word);
+    return model_accept(model, word);
+}
+
+static void model_run(dongle_model_t *model) {
+    if (opcode_of(model->header) != OPCODE_CONTROL) {
+        model->queued_length = build_report(model->header, model->payload, model->queued);
+    } else if ((model->header >> 8 & 7) == 0x02) {
+        model_end_session(model);
+    }
+}
+
+static model_outcome_t model_session_word(dongle_model_t *model, uint16_t word) {
+    uint16_t data = word & 0x7FFF;
+    if (model->need) {
+        if (!payload_valid(model->header, model->have, data)) {
+            return model_reject(model, word);
+        }
+        model->payload[model->have++] = data;
+        model->toggle = word >> 15;
+        if (--model->need == 0) {
+            model_run(model);
+        }
+        return model_accept(model, word);
+    }
+    int need = payload_words(data);
+    if (need < 0) {
+        return model_reject(model, word);
+    }
+    model->header = data;
+    model->have = 0;
+    model->need = need;
+    model->toggle = word >> 15;
+    if (need == 0) {
+        model_run(model);
+    }
+    return model_accept(model, word);
+}
+
+static model_outcome_t model_word(dongle_model_t *model, uint16_t word) {
+    if (model_copy(model, word)) {
+        return (model_outcome_t) {.copy = true};
+    }
+    if (model->active) {
+        model_outcome_t outcome = model_session_word(model, word);
+        if (!model->active) {
+            model->ended = true;
+            model->end_word = word;
+        }
+        return outcome;
+    }
+    model->ended = false;
+    if (!model_hello_step(model, word)) {
+        return (model_outcome_t) {.accepted = false};
+    }
+    if (model->hello == SC2_LINK_HELLO_WORD_COUNT) {
+        model->active = true;
+        model->hello = 0;
+        model->need = 0;
+        model->toggle = 0;
+    }
+    return model_accept(model, word);
+}
+
+/*
+ * The transport over the model: sc2link_test.py's FakeLink. The session times
+ * out before the word sent as number timeout_before, the word sent as number
+ * refused_at is never taken, as with a relay that stays full, and right after
+ * the word sent as number foreign_after the dongle takes foreign_word from
+ * another FF client.
+ */
+#define SENT_MAX 128
+#define NONE (-1)
+
+typedef struct fake_link_t {
+    dongle_model_t model;
+    uint16_t sent[SENT_MAX];
+    int sent_count;
+    int timeout_before;
+    int refused_at;
+    int foreign_after;
+    uint16_t foreign_word;
+    bool stopping;
+    int silences;
+} fake_link_t;
+
+static sc2_link_word_result_t fake_send_word(void *context, uint16_t word, bool in_session,
+                                             sc2_link_acknowledgement_t *acknowledgement) {
+    fake_link_t *link = context;
+    int index = link->sent_count;
+    TEST_ASSERT_LESS_THAN_INT(SENT_MAX - SC2_LINK_MAX_RESENDS, index);
+    if (index == link->timeout_before) {
+        model_end_session(&link->model);
+    }
+    acknowledgement->state_before = model_state(&link->model);
+    link->sent[link->sent_count++] = word;
+    model_outcome_t outcome = {.accepted = false};
+    if (index != link->refused_at) {
+        outcome = model_word(&link->model, word);
+    }
+    if (index == link->foreign_after) {
+        model_word(&link->model, link->foreign_word);
+    }
+    acknowledgement->echo = link->model.echo;
+    acknowledgement->state = model_state(&link->model);
+    if (outcome.accepted) {
+        return SC2_LINK_WORD_ACKNOWLEDGED;
+    }
+    // Each resend is a copy or refused again.
+    if (!(in_session && !link->model.active)) {
+        for (int resend = 0; resend < SC2_LINK_MAX_RESENDS; resend++) {
+            link->sent[link->sent_count++] = word;
+        }
+    }
+    return SC2_LINK_WORD_UNACKNOWLEDGED;
+}
+
+static bool fake_read_state(void *context, uint16_t *state) {
+    fake_link_t *link = context;
+    *state = model_state(&link->model);
+    return true;
+}
+
+static bool fake_wait_silence(void *context, uint32_t milliseconds) {
+    fake_link_t *link = context;
+    if (milliseconds >= 500 && link->model.active) {
+        model_end_session(&link->model);
+    }
+    link->model.hello = 0;
+    link->silences++;
+    return !link->stopping;
+}
+
+static bool fake_stopping(void *context) {
+    fake_link_t *link = context;
+    return link->stopping;
+}
+
+static fake_link_t fake_link;
+static sc2_link_transport_t fake_transport;
+static sc2_link_client_t client;
+
+static void assert_sent(int from, const uint16_t *expected, int count) {
+    TEST_ASSERT_GREATER_OR_EQUAL_INT(from + count, fake_link.sent_count);
+    TEST_ASSERT_EQUAL_HEX16_ARRAY(expected, fake_link.sent + from, count);
+}
+
+static int sent_times(uint16_t word) {
+    int times = 0;
+    for (int index = 0; index < fake_link.sent_count; index++) {
+        times += fake_link.sent[index] == word;
+    }
+    return times;
+}
+
 /** Checks the message as the dongle parses it and returns the report it builds. */
 static size_t report_of(const sc2_link_message_t *message, uint8_t report[REPORT_LENGTH_MAX]) {
     TEST_ASSERT_GREATER_THAN_UINT8(0, message->word_count);
@@ -210,6 +427,18 @@ static sc2_link_message_t effect_message(const LI_CONTROLLER_HAPTIC_EFFECT *effe
 }
 
 void setUp(void) {
+    memset(&fake_link, 0, sizeof(fake_link));
+    fake_link.timeout_before = NONE;
+    fake_link.refused_at = NONE;
+    fake_link.foreign_after = NONE;
+    fake_transport = (sc2_link_transport_t) {
+            .context = &fake_link,
+            .send_word = fake_send_word,
+            .read_state = fake_read_state,
+            .wait_silence = fake_wait_silence,
+            .stopping = fake_stopping,
+    };
+    memset(&client, 0, sizeof(client));
 }
 
 void tearDown(void) {
@@ -502,6 +731,267 @@ void test_unknown_effect_kind_has_no_message(void) {
     TEST_ASSERT_FALSE(sc2_link_haptic_effect_message(&effect, &message));
 }
 
+/* xpad sends the high byte of each magnitude, strong first. */
+void test_magnitudes(void) {
+    TEST_ASSERT_EQUAL_HEX16(0x1200, sc2_link_strong_magnitude(0x1234));
+    TEST_ASSERT_EQUAL_HEX16(0x3400, sc2_link_weak_magnitude(0x1234));
+    TEST_ASSERT_EQUAL_HEX16(0xFF00, sc2_link_strong_magnitude(0xFFFF));
+    TEST_ASSERT_EQUAL_HEX16(0xFF00, sc2_link_weak_magnitude(0xFFFF));
+    TEST_ASSERT_EQUAL_HEX16(0x0000, sc2_link_weak_magnitude(0x0100));
+}
+
+/* test_sc2link.py's State.test_ack_state_fields. */
+void test_ack_state_fields(void) {
+    TEST_ASSERT_EQUAL_UINT8(0xFF, sc2_link_accepted_count(0xFFC1));
+    TEST_ASSERT_TRUE(sc2_link_session_active(0xFFC1));
+    TEST_ASSERT_EQUAL_UINT8(4, sc2_link_expected_words(0xFFC1));
+    TEST_ASSERT_EQUAL_UINT8(1, sc2_link_protocol_version(0xFFC1));
+    TEST_ASSERT_FALSE(sc2_link_session_active(0x0231));
+    TEST_ASSERT_EQUAL_UINT8(3, sc2_link_expected_words(0x0231));
+}
+
+void test_state_advanced(void) {
+    TEST_ASSERT_FALSE(sc2_link_state_advanced(0x0581, 0x0581));
+    TEST_ASSERT_FALSE(sc2_link_state_advanced(0x0581, 0x0501));
+    TEST_ASSERT_TRUE(sc2_link_state_advanced(0x0581, 0x0681));
+    TEST_ASSERT_TRUE(sc2_link_state_advanced(0xFF81, 0x0081));
+    TEST_ASSERT_TRUE(sc2_link_state_advanced(0x0081, 0x7F81));
+    // A count that went back is an older frame.
+    TEST_ASSERT_FALSE(sc2_link_state_advanced(0x0581, 0x0481));
+    TEST_ASSERT_FALSE(sc2_link_state_advanced(0x0081, 0x8081));
+}
+
+void test_word_acknowledged(void) {
+    sc2_link_acknowledgement_t acknowledgement = {.state_before = 0xFF81, .echo = 0x8400, .state = 0x0081};
+    TEST_ASSERT_TRUE(sc2_link_word_acknowledged(&acknowledgement, 0x8400));
+    TEST_ASSERT_FALSE(sc2_link_word_acknowledged(&acknowledgement, 0x0400));
+    // Another client's word was taken as well.
+    acknowledgement.state = 0x0181;
+    TEST_ASSERT_FALSE(sc2_link_word_acknowledged(&acknowledgement, 0x8400));
+    acknowledgement.state = 0xFF81;
+    TEST_ASSERT_FALSE(sc2_link_word_acknowledged(&acknowledgement, 0x8400));
+}
+
+void test_hello_needs_silence(void) {
+    TEST_ASSERT_FALSE(sc2_link_hello_needs_silence(0x0001));
+    TEST_ASSERT_FALSE(sc2_link_hello_needs_silence(0x0000));
+    TEST_ASSERT_TRUE(sc2_link_hello_needs_silence(0x0081));
+    TEST_ASSERT_TRUE(sc2_link_hello_needs_silence(0x0021));
+}
+
+void test_queue_keeps_order(void) {
+    sc2_link_message_queue_t queue = {.count = 0};
+    sc2_link_message_t message;
+    TEST_ASSERT_FALSE(sc2_link_queue_pop(&queue, &message));
+    sc2_link_message_t tick = sc2_link_command_message(1, 1, 0);
+    sc2_link_message_t click = sc2_link_command_message(2, 2, 0);
+    sc2_link_queue_push(&queue, &tick);
+    sc2_link_queue_push(&queue, &click);
+    TEST_ASSERT_TRUE(sc2_link_queue_pop(&queue, &message));
+    TEST_ASSERT_EQUAL_HEX16(tick.data_words[0], message.data_words[0]);
+    TEST_ASSERT_TRUE(sc2_link_queue_pop(&queue, &message));
+    TEST_ASSERT_EQUAL_HEX16(click.data_words[0], message.data_words[0]);
+    TEST_ASSERT_FALSE(sc2_link_queue_pop(&queue, &message));
+}
+
+/* A RUMBLE that has not gone out yet takes the newer level, and effects keep their order. */
+void test_queue_replaces_waiting_rumble(void) {
+    sc2_link_message_queue_t queue = {.count = 0};
+    sc2_link_message_t tick = sc2_link_command_message(1, 1, 0);
+    sc2_link_message_t first = sc2_link_rumble_message(0x1000, 0x2000);
+    sc2_link_message_t stop = sc2_link_rumble_message(0, 0);
+    sc2_link_queue_push(&queue, &first);
+    sc2_link_queue_push(&queue, &tick);
+    sc2_link_queue_push(&queue, &stop);
+    TEST_ASSERT_EQUAL_UINT8(2, queue.count);
+    sc2_link_message_t message;
+    sc2_link_queue_pop(&queue, &message);
+    TEST_ASSERT_EQUAL_UINT8(stop.word_count, message.word_count);
+    TEST_ASSERT_EQUAL_HEX16(stop.data_words[0], message.data_words[0]);
+    sc2_link_queue_pop(&queue, &message);
+    TEST_ASSERT_EQUAL_HEX16(tick.data_words[0], message.data_words[0]);
+}
+
+/* A full queue drops the oldest effect and keeps the RUMBLE. */
+void test_full_queue_drops_oldest_effect(void) {
+    sc2_link_message_queue_t queue = {.count = 0};
+    sc2_link_message_t rumble = sc2_link_rumble_message(0, 0);
+    sc2_link_queue_push(&queue, &rumble);
+    for (int index = 0; index < SC2_LINK_MESSAGE_QUEUE_CAPACITY; index++) {
+        sc2_link_message_t script = sc2_link_script_message(3, (uint8_t) index, 0);
+        sc2_link_queue_push(&queue, &script);
+    }
+    TEST_ASSERT_EQUAL_UINT8(SC2_LINK_MESSAGE_QUEUE_CAPACITY, queue.count);
+    sc2_link_message_t message;
+    sc2_link_queue_pop(&queue, &message);
+    TEST_ASSERT_TRUE(message.rumble);
+    sc2_link_queue_pop(&queue, &message);
+    TEST_ASSERT_EQUAL_HEX16(1, message.data_words[1]);
+    for (int index = 2; index < SC2_LINK_MESSAGE_QUEUE_CAPACITY; index++) {
+        sc2_link_queue_pop(&queue, &message);
+        TEST_ASSERT_EQUAL_HEX16(index, message.data_words[1]);
+    }
+    TEST_ASSERT_FALSE(sc2_link_queue_pop(&queue, &message));
+}
+
+void test_hello_opens_a_session(void) {
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_hello(&client, &fake_transport));
+    TEST_ASSERT_TRUE(client.in_session);
+    TEST_ASSERT_EQUAL_UINT8(0, client.toggle);
+    TEST_ASSERT_TRUE(fake_link.model.active);
+    assert_sent(0, sc2_link_hello_words, SC2_LINK_HELLO_WORD_COUNT);
+    TEST_ASSERT_EQUAL_INT(0, fake_link.silences);
+}
+
+/* Another session, or a HELLO in progress, must time out first. */
+void test_hello_waits_for_silence_while_a_session_runs(void) {
+    for (int index = 0; index < SC2_LINK_HELLO_WORD_COUNT; index++) {
+        model_word(&fake_link.model, sc2_link_hello_words[index]);
+    }
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_hello(&client, &fake_transport));
+    TEST_ASSERT_EQUAL_INT(1, fake_link.silences);
+    assert_sent(0, sc2_link_hello_words, SC2_LINK_HELLO_WORD_COUNT);
+}
+
+void test_hello_without_acknowledgement_fails(void) {
+    fake_link.refused_at = 0;
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_FAILED, sc2_link_client_hello(&client, &fake_transport));
+    TEST_ASSERT_FALSE(client.in_session);
+    TEST_ASSERT_EQUAL_INT(1 + SC2_LINK_MAX_RESENDS, fake_link.sent_count);
+}
+
+void test_toggles_alternate_across_messages(void) {
+    sc2_link_message_t nop = sc2_link_nop_message();
+    for (int index = 0; index < 3; index++) {
+        TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_deliver(&client, &fake_transport, &nop));
+    }
+    static const uint16_t expected[] = {0x8000, 0x0000, 0x8000};
+    assert_sent(SC2_LINK_HELLO_WORD_COUNT, expected, 3);
+    TEST_ASSERT_EQUAL_INT(SC2_LINK_HELLO_WORD_COUNT + 3, fake_link.sent_count);
+}
+
+/*
+ * test_sc2link.py's Client.test_a_session_lost_mid_message_restarts_it: the
+ * session times out before the third pulse word, which the dongle then sees
+ * as plain rumble. It is not resent, and the whole message follows a new
+ * HELLO.
+ */
+void test_a_session_lost_mid_message_restarts_it(void) {
+    sc2_link_message_t pulse = sc2_link_pulse_message(3, 1000, 1000, 3);
+    uint16_t words[SC2_LINK_MESSAGE_WORDS_MAX];
+    sc2_link_stamp_message(&pulse, 0, words);
+    fake_link.timeout_before = 6;
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_hello(&client, &fake_transport));
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_deliver(&client, &fake_transport, &pulse));
+    assert_sent(4, words, 3);
+    assert_sent(7, sc2_link_hello_words, SC2_LINK_HELLO_WORD_COUNT);
+    assert_sent(11, words, 4);
+    TEST_ASSERT_EQUAL_INT(15, fake_link.sent_count);
+    static const uint8_t report[] = {0x81, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x03, 0x00};
+    TEST_ASSERT_EQUAL_size_t(sizeof(report), fake_link.model.queued_length);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(report, fake_link.model.queued, sizeof(report));
+}
+
+/* test_sc2link.py's Client.test_a_session_found_gone_before_a_message. */
+void test_a_session_found_gone_before_a_message(void) {
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_hello(&client, &fake_transport));
+    fake_wait_silence(&fake_link, SC2_LINK_SILENCE_MS);
+    sc2_link_message_t nop = sc2_link_nop_message();
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_deliver(&client, &fake_transport, &nop));
+    assert_sent(4, sc2_link_hello_words, SC2_LINK_HELLO_WORD_COUNT);
+    static const uint16_t nop_word[] = {0x8000};
+    assert_sent(8, nop_word, 1);
+    TEST_ASSERT_EQUAL_INT(9, fake_link.sent_count);
+}
+
+/*
+ * test_sc2link.py's Client.test_a_missing_acknowledgement_stops_the_message:
+ * the refused word goes out with its resends and nothing after it. The next
+ * message waits for the session to time out before its HELLO.
+ */
+void test_a_missing_acknowledgement_drops_the_message(void) {
+    sc2_link_message_t pulse = sc2_link_pulse_message(3, 1000, 1000, 3);
+    fake_link.refused_at = 5;
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_hello(&client, &fake_transport));
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DROPPED, sc2_link_client_deliver(&client, &fake_transport, &pulse));
+    TEST_ASSERT_EQUAL_INT(4 + 2 + SC2_LINK_MAX_RESENDS, fake_link.sent_count);
+    TEST_ASSERT_FALSE(client.in_session);
+
+    sc2_link_message_t nop = sc2_link_nop_message();
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_deliver(&client, &fake_transport, &nop));
+    TEST_ASSERT_EQUAL_INT(1, fake_link.silences);
+    assert_sent(16, sc2_link_hello_words, SC2_LINK_HELLO_WORD_COUNT);
+}
+
+/* test_sc2link.py's Client.test_a_rejected_message_is_tried_twice, with a reserved opcode. */
+void test_a_rejected_message_is_tried_twice(void) {
+    sc2_link_message_t reserved = {.data_words = {0x3800}, .word_count = 1};
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DROPPED, sc2_link_client_deliver(&client, &fake_transport, &reserved));
+    TEST_ASSERT_EQUAL_INT(2, sent_times(0xB800));
+}
+
+/* test_sc2link.py's Client.test_bye_ends_the_session_without_a_restart. */
+void test_bye_ends_the_session_without_a_restart(void) {
+    sc2_link_message_t bye = sc2_link_bye_message();
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_deliver(&client, &fake_transport, &bye));
+    TEST_ASSERT_EQUAL_INT(5, fake_link.sent_count);
+    TEST_ASSERT_FALSE(fake_link.model.active);
+}
+
+void test_client_bye(void) {
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_hello(&client, &fake_transport));
+    sc2_link_client_bye(&client, &fake_transport);
+    static const uint16_t bye_word[] = {0x8200};
+    assert_sent(4, bye_word, 1);
+    TEST_ASSERT_FALSE(fake_link.model.active);
+    TEST_ASSERT_FALSE(client.in_session);
+    // Nothing to end without a session.
+    sc2_link_client_bye(&client, &fake_transport);
+    TEST_ASSERT_EQUAL_INT(5, fake_link.sent_count);
+}
+
+/* A session the dongle already ended needs no BYE. */
+void test_client_bye_after_timeout_sends_nothing(void) {
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_hello(&client, &fake_transport));
+    fake_wait_silence(&fake_link, SC2_LINK_SILENCE_MS);
+    sc2_link_client_bye(&client, &fake_transport);
+    TEST_ASSERT_EQUAL_INT(4, fake_link.sent_count);
+}
+
+/*
+ * Another FF client's word, taken right after this client's, leaves the
+ * toggles out of step: the message starts over after the session timed out.
+ */
+void test_another_clients_word_starts_over(void) {
+    sc2_link_message_t pulse = sc2_link_pulse_message(3, 1000, 1000, 3);
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_hello(&client, &fake_transport));
+    fake_link.foreign_after = 5;
+    fake_link.foreign_word = 0x8123;
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_deliver(&client, &fake_transport, &pulse));
+    TEST_ASSERT_EQUAL_INT(1, fake_link.silences);
+    uint16_t words[SC2_LINK_MESSAGE_WORDS_MAX];
+    sc2_link_stamp_message(&pulse, 0, words);
+    assert_sent(6, sc2_link_hello_words, SC2_LINK_HELLO_WORD_COUNT);
+    assert_sent(10, words, 4);
+    static const uint8_t report[] = {0x81, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0x03, 0x00};
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(report, fake_link.model.queued, sizeof(report));
+}
+
+/* Stopping opens no session, also not to resend a message whose session got lost. */
+void test_stopping_opens_no_session(void) {
+    sc2_link_message_t nop = sc2_link_nop_message();
+    fake_link.stopping = true;
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_STOPPED, sc2_link_client_deliver(&client, &fake_transport, &nop));
+    TEST_ASSERT_EQUAL_INT(0, fake_link.sent_count);
+
+    fake_link.stopping = false;
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_hello(&client, &fake_transport));
+    fake_link.stopping = true;
+    fake_link.timeout_before = 4;
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_STOPPED, sc2_link_client_deliver(&client, &fake_transport, &nop));
+    TEST_ASSERT_EQUAL_INT(5, fake_link.sent_count);
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_protocol_example);
@@ -521,5 +1011,26 @@ int main() {
     RUN_TEST(test_host_rumble_rebuilds_report_0x80);
     RUN_TEST(test_effect_durations_saturate);
     RUN_TEST(test_unknown_effect_kind_has_no_message);
+    RUN_TEST(test_magnitudes);
+    RUN_TEST(test_ack_state_fields);
+    RUN_TEST(test_state_advanced);
+    RUN_TEST(test_word_acknowledged);
+    RUN_TEST(test_hello_needs_silence);
+    RUN_TEST(test_queue_keeps_order);
+    RUN_TEST(test_queue_replaces_waiting_rumble);
+    RUN_TEST(test_full_queue_drops_oldest_effect);
+    RUN_TEST(test_hello_opens_a_session);
+    RUN_TEST(test_hello_waits_for_silence_while_a_session_runs);
+    RUN_TEST(test_hello_without_acknowledgement_fails);
+    RUN_TEST(test_toggles_alternate_across_messages);
+    RUN_TEST(test_a_session_lost_mid_message_restarts_it);
+    RUN_TEST(test_a_session_found_gone_before_a_message);
+    RUN_TEST(test_a_missing_acknowledgement_drops_the_message);
+    RUN_TEST(test_a_rejected_message_is_tried_twice);
+    RUN_TEST(test_bye_ends_the_session_without_a_restart);
+    RUN_TEST(test_client_bye);
+    RUN_TEST(test_client_bye_after_timeout_sends_nothing);
+    RUN_TEST(test_another_clients_word_starts_over);
+    RUN_TEST(test_stopping_opens_no_session);
     return UNITY_END();
 }
