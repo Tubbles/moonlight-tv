@@ -20,6 +20,9 @@
 #define OPCODE_COMMAND 8
 #define REPORT_LENGTH_MAX 10
 #define HAPTIC_TYPE_RUMBLE 4
+#define PROTOCOL_VERSION 2
+// Sides 6 and 7 name no actuator.
+#define SIDE_MAX 5
 
 static int opcode_of(uint16_t header) {
     return header & 0x4000 ? OPCODE_COMMAND : header >> 11 & 7;
@@ -47,12 +50,12 @@ static int payload_words(uint16_t header) {
         uint16_t unused_bits;
         int payload_words;
     } layouts[] = {
-            {OPCODE_COMMAND, 0x2000, 0},
-            {OPCODE_SCRIPT, 0x0400, 1},
+            {OPCODE_COMMAND, 0x0000, 0},
+            {OPCODE_SCRIPT, 0x0000, 1},
             {OPCODE_RUMBLE, 0x07F8, 2},
-            {OPCODE_PULSE, 0x04F8, 3},
-            {OPCODE_SWEEP, 0x0400, 4},
-            {OPCODE_TONE, 0x0400, 4},
+            {OPCODE_PULSE, 0x00F8, 3},
+            {OPCODE_SWEEP, 0x0000, 4},
+            {OPCODE_TONE, 0x0000, 4},
     };
     for (size_t index = 0; index < sizeof(layouts) / sizeof(layouts[0]); index++) {
         if (layouts[index].opcode != opcode) {
@@ -63,6 +66,9 @@ static int payload_words(uint16_t header) {
         }
         if (opcode == OPCODE_RUMBLE && (header & 4)) {
             return header & 3 ? -1 : 0;
+        }
+        if (opcode != OPCODE_RUMBLE && (header >> 8 & 7) > SIDE_MAX) {
+            return -1;
         }
         return layouts[index].payload_words;
     }
@@ -96,13 +102,13 @@ static void put16(uint8_t *report, uint16_t value) {
 
 /** The report a complete message queues, report id first, as SDL's controller_structs.h lays them out. */
 static size_t build_report(uint16_t header, const uint16_t *payload, uint8_t report[REPORT_LENGTH_MAX]) {
-    uint8_t side = header >> 8 & 3;
+    uint8_t side = header >> 8 & 7;
     uint8_t gain = header & 0xFF;
     switch (opcode_of(header)) {
         case OPCODE_COMMAND:
             report[0] = 0x82;
             report[1] = side;
-            report[2] = header >> 10 & 7;
+            report[2] = header >> 11 & 7;
             report[3] = gain;
             return 4;
         case OPCODE_SCRIPT:
@@ -154,6 +160,8 @@ static size_t build_report(uint16_t header, const uint16_t *payload, uint8_t rep
 
 /* What the dongle does with each word, its timeouts and knock aside: the Model of sc2link_test.py. */
 typedef struct dongle_model_t {
+    // The protocol version the acknowledgements show.
+    uint8_t version;
     uint8_t counter;
     bool active;
     int hello;
@@ -177,7 +185,7 @@ typedef struct model_outcome_t {
 
 static uint16_t model_state(const dongle_model_t *model) {
     int expected = model->active ? model->need : (model->hello ? SC2_LINK_HELLO_WORD_COUNT - model->hello : 0);
-    return (uint16_t) (model->counter << 8 | (model->active ? 0x80 : 0) | (expected & 7) << 4 | 1);
+    return (uint16_t) (model->counter << 8 | (model->active ? 0x80 : 0) | (expected & 7) << 4 | model->version);
 }
 
 static void model_end_session(dongle_model_t *model) {
@@ -409,7 +417,11 @@ static void assert_words(const uint16_t *expected, uint8_t expected_count, const
         assert_words(expected, sizeof(expected) / sizeof(expected[0]), &actual);                                       \
     } while (0)
 
-/* What libvirtualhid makes of report 0x82 and what Sunshine passes on. */
+/*
+ * What libvirtualhid makes of report 0x82 and what Sunshine passes on. The
+ * target is the report's side byte for 1 to 3, whatever LI_HAPTIC_TARGET_*
+ * calls them.
+ */
 static LI_CONTROLLER_HAPTIC_EFFECT command_effect(uint8_t target, uint8_t kind, int8_t gain_db) {
     LI_CONTROLLER_HAPTIC_EFFECT effect;
     memset(&effect, 0, sizeof(effect));
@@ -428,6 +440,7 @@ static sc2_link_message_t effect_message(const LI_CONTROLLER_HAPTIC_EFFECT *effe
 
 void setUp(void) {
     memset(&fake_link, 0, sizeof(fake_link));
+    fake_link.model.version = PROTOCOL_VERSION;
     fake_link.timeout_before = NONE;
     fake_link.refused_at = NONE;
     fake_link.foreign_after = NONE;
@@ -444,19 +457,24 @@ void setUp(void) {
 void tearDown(void) {
 }
 
-/* docs/PROTOCOL.md: a click on both pads at -10 dB is COMMAND data 0x4BF6, report 82 03 02 F6. */
+/* docs/PROTOCOL.md: a click on both pads at -10 dB is COMMAND data 0x52F6, report 82 02 02 F6. */
 void test_protocol_example(void) {
-    ASSERT_WORDS(sc2_link_command_message(3, 2, -10), 0x4BF6);
-    ASSERT_REPORT(sc2_link_command_message(3, 2, -10), 0x82, 0x03, 0x02, 0xF6);
+    ASSERT_WORDS(sc2_link_command_message(2, 2, -10), 0x52F6);
+    ASSERT_REPORT(sc2_link_command_message(2, 2, -10), 0x82, 0x02, 0x02, 0xF6);
 }
 
 /* The vectors of test_sc2link.py's Encoder.test_layouts. */
 void test_layouts(void) {
+    ASSERT_WORDS(sc2_link_command_message(5, 7, -1), 0x7DFF);
     ASSERT_WORDS(sc2_link_script_message(1, 0xFF, -1), 0x09FF, 0x00FF);
+    ASSERT_WORDS(sc2_link_script_message(5, 0, -128), 0x0D80, 0x0000);
     ASSERT_WORDS(sc2_link_rumble_message(0xFFFF, 0x1234), 0x1002, 0x7FFF, 0x1234);
     ASSERT_WORDS(sc2_link_pulse_message(3, 0xFFFF, 1, 0x8000), 0x1B05, 0x7FFF, 0x0001, 0x0000);
+    ASSERT_WORDS(sc2_link_pulse_message(5, 0, 0, 0), 0x1D00, 0x0000, 0x0000, 0x0000);
     ASSERT_WORDS(sc2_link_sweep_message(1, -128, 0xFFFF, 2, 0x8003), 0x2180, 0x7FFF, 0x0002, 0x0003, 0x0005);
+    ASSERT_WORDS(sc2_link_sweep_message(4, 0, 0, 0, 0), 0x2400, 0x0000, 0x0000, 0x0000, 0x0000);
     ASSERT_WORDS(sc2_link_tone_message(2, 127, 0xFFFF, 4, 0x8005, 0xFF), 0x2A7F, 0x7FFF, 0x0004, 0x0005, 0x05FF);
+    ASSERT_WORDS(sc2_link_tone_message(5, 0, 0, 0, 0, 0), 0x2D00, 0x0000, 0x0000, 0x0000, 0x0000);
 }
 
 void test_control_words(void) {
@@ -530,7 +548,7 @@ typedef enum message_type_t {
 } message_type_t;
 
 #define FIELDS_MAX 6
-#define SIDE {0, 3}
+#define SIDE {0, SIDE_MAX}
 #define GAIN {-128, 127}
 #define WORD {0, 0xFFFF}
 
@@ -641,10 +659,29 @@ void test_round_trip_every_boundary(void) {
     }
 }
 
-/* Out-of-range sides and commands must not reach bits the dongle rejects. */
-void test_narrow_fields_stay_in_their_bits(void) {
-    ASSERT_REPORT(sc2_link_command_message(7, 0xF2, 0), 0x82, 0x03, 0x02, 0x00);
-    ASSERT_REPORT(sc2_link_pulse_message(0xFF, 1, 2, 3), 0x81, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00);
+/* test_sc2link.py's Encoder.test_every_side: each side, the other fields at their minimum and at their maximum. */
+void test_every_side(void) {
+    for (int type = 0; type < MESSAGE_TYPE_COUNT; type++) {
+        if (type == MESSAGE_RUMBLE) {
+            continue;
+        }
+        for (int side = 0; side <= SIDE_MAX; side++) {
+            for (int at_maximum = 0; at_maximum < 2; at_maximum++) {
+                int values[FIELDS_MAX];
+                values[0] = side;
+                for (int index = 1; index < message_types[type].field_count; index++) {
+                    field_t field = message_types[type].fields[index];
+                    values[index] = at_maximum ? field.maximum : field.minimum;
+                }
+                assert_round_trip(type, values);
+            }
+        }
+    }
+}
+
+/* An out-of-range command must not reach the side's bits. */
+void test_command_stays_in_its_bits(void) {
+    ASSERT_REPORT(sc2_link_command_message(5, 0xF2, 0), 0x82, 0x05, 0x02, 0x00);
 }
 
 /*
@@ -653,21 +690,21 @@ void test_narrow_fields_stay_in_their_bits(void) {
  * report.
  */
 void test_command_kinds_rebuild_report_0x82(void) {
-    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(LI_HAPTIC_TARGET_BOTH, LI_HAPTIC_EFFECT_CLICK, -10);
+    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(3, LI_HAPTIC_EFFECT_CLICK, -10);
     ASSERT_REPORT(effect_message(&effect), 0x82, 0x03, 0x02, 0xF6);
-    effect = command_effect(LI_HAPTIC_TARGET_BOTH, LI_HAPTIC_EFFECT_OFF, 0);
+    effect = command_effect(3, LI_HAPTIC_EFFECT_OFF, 0);
     ASSERT_REPORT(effect_message(&effect), 0x82, 0x03, 0x00, 0x00);
-    effect = command_effect(LI_HAPTIC_TARGET_LEFT, LI_HAPTIC_EFFECT_TICK, -128);
+    effect = command_effect(1, LI_HAPTIC_EFFECT_TICK, -128);
     ASSERT_REPORT(effect_message(&effect), 0x82, 0x01, 0x01, 0x80);
-    effect = command_effect(LI_HAPTIC_TARGET_RIGHT, LI_HAPTIC_EFFECT_RUMBLE, 127);
+    effect = command_effect(2, LI_HAPTIC_EFFECT_RUMBLE, 127);
     ASSERT_REPORT(effect_message(&effect), 0x82, 0x02, 0x04, 0x7F);
-    effect = command_effect(LI_HAPTIC_TARGET_NONE, LI_HAPTIC_EFFECT_NOISE, -1);
+    effect = command_effect(0, LI_HAPTIC_EFFECT_NOISE, -1);
     ASSERT_REPORT(effect_message(&effect), 0x82, 0x00, 0x05, 0xFF);
 }
 
 /* 81 03 FF FF 01 00 00 80: on, off and repeat are the report's 16-bit fields. */
 void test_pulse_rebuilds_report_0x81(void) {
-    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(LI_HAPTIC_TARGET_BOTH, LI_HAPTIC_EFFECT_PULSE, 0);
+    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(3, LI_HAPTIC_EFFECT_PULSE, 0);
     effect.durationUs = 0xFFFF;
     effect.intervalUs = 1;
     effect.repeatCount = 0x8000;
@@ -676,7 +713,7 @@ void test_pulse_rebuilds_report_0x81(void) {
 
 /* 83 02 7F FF FF 04 00 05 00 FF: the host holds the duration in microseconds. */
 void test_tone_rebuilds_report_0x83(void) {
-    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(LI_HAPTIC_TARGET_RIGHT, LI_HAPTIC_EFFECT_TONE, 127);
+    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(2, LI_HAPTIC_EFFECT_TONE, 127);
     effect.frequencyHz = 0xFFFF;
     effect.durationUs = 4 * 1000;
     effect.lfoFrequencyHz = 5;
@@ -686,8 +723,7 @@ void test_tone_rebuilds_report_0x83(void) {
 
 /* 84 01 80 FF FF 02 00 03 00. */
 void test_sweep_rebuilds_report_0x84(void) {
-    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(LI_HAPTIC_TARGET_LEFT, LI_HAPTIC_EFFECT_LOGARITHMIC_SWEEP,
-                                                        -128);
+    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(1, LI_HAPTIC_EFFECT_LOGARITHMIC_SWEEP, -128);
     effect.durationUs = 0xFFFF * 1000;
     effect.startFrequencyHz = 2;
     effect.endFrequencyHz = 3;
@@ -696,7 +732,7 @@ void test_sweep_rebuilds_report_0x84(void) {
 
 /* 85 01 FF FF. */
 void test_script_rebuilds_report_0x85(void) {
-    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(LI_HAPTIC_TARGET_LEFT, LI_HAPTIC_EFFECT_SCRIPT, -1);
+    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(1, LI_HAPTIC_EFFECT_SCRIPT, -1);
     effect.scriptId = 0xFF;
     ASSERT_REPORT(effect_message(&effect), 0x85, 0x01, 0xFF, 0xFF);
 }
@@ -709,7 +745,7 @@ void test_host_rumble_rebuilds_report_0x80(void) {
 
 /* Durations beyond the report's fields saturate rather than wrap. */
 void test_effect_durations_saturate(void) {
-    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(LI_HAPTIC_TARGET_BOTH, LI_HAPTIC_EFFECT_PULSE, 0);
+    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(3, LI_HAPTIC_EFFECT_PULSE, 0);
     effect.durationUs = 70000;
     effect.intervalUs = 0xFFFFFFFFu;
     effect.repeatCount = 2;
@@ -718,7 +754,7 @@ void test_effect_durations_saturate(void) {
     effect.intervalUs = 0;
     ASSERT_REPORT(effect_message(&effect), 0x81, 0x03, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00);
 
-    effect = command_effect(LI_HAPTIC_TARGET_BOTH, LI_HAPTIC_EFFECT_TONE, 0);
+    effect = command_effect(3, LI_HAPTIC_EFFECT_TONE, 0);
     effect.durationUs = 70000 * 1000;
     ASSERT_REPORT(effect_message(&effect), 0x83, 0x03, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00);
     effect.durationUs = 1999;
@@ -726,9 +762,37 @@ void test_effect_durations_saturate(void) {
 }
 
 void test_unknown_effect_kind_has_no_message(void) {
-    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(LI_HAPTIC_TARGET_BOTH, LI_HAPTIC_EFFECT_PULSE + 1, 0);
+    LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(3, LI_HAPTIC_EFFECT_PULSE + 1, 0);
     sc2_link_message_t message;
     TEST_ASSERT_FALSE(sc2_link_haptic_effect_message(&effect, &message));
+}
+
+/*
+ * The target is Steam's side byte, so every kind sends it as it came. 0 also
+ * stands for the right grip and both grips, which libvirtualhid turns into 0.
+ */
+void test_targets_go_out_as_the_side(void) {
+    for (uint8_t kind = LI_HAPTIC_EFFECT_OFF; kind <= LI_HAPTIC_EFFECT_PULSE; kind++) {
+        for (uint8_t target = 0; target <= SC2_LINK_SIDE_MAX; target++) {
+            LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(target, kind, 0);
+            sc2_link_message_t message = effect_message(&effect);
+            uint8_t report[REPORT_LENGTH_MAX];
+            report_of(&message, report);
+            TEST_ASSERT_EQUAL_UINT8(target, report[1]);
+        }
+    }
+}
+
+/* Sides 6 and 7 end the session, larger ones do not fit the field. */
+void test_targets_above_side_max_have_no_message(void) {
+    static const uint8_t targets[] = {6, 7, 8, 0xFF};
+    for (uint8_t kind = LI_HAPTIC_EFFECT_OFF; kind <= LI_HAPTIC_EFFECT_PULSE; kind++) {
+        for (size_t index = 0; index < sizeof(targets); index++) {
+            LI_CONTROLLER_HAPTIC_EFFECT effect = command_effect(targets[index], kind, 0);
+            sc2_link_message_t message;
+            TEST_ASSERT_FALSE(sc2_link_haptic_effect_message(&effect, &message));
+        }
+    }
 }
 
 /* xpad sends the high byte of each magnitude, strong first. */
@@ -742,10 +806,10 @@ void test_magnitudes(void) {
 
 /* test_sc2link.py's State.test_ack_state_fields. */
 void test_ack_state_fields(void) {
-    TEST_ASSERT_EQUAL_UINT8(0xFF, sc2_link_accepted_count(0xFFC1));
-    TEST_ASSERT_TRUE(sc2_link_session_active(0xFFC1));
-    TEST_ASSERT_EQUAL_UINT8(4, sc2_link_expected_words(0xFFC1));
-    TEST_ASSERT_EQUAL_UINT8(1, sc2_link_protocol_version(0xFFC1));
+    TEST_ASSERT_EQUAL_UINT8(0xFF, sc2_link_accepted_count(0xFFC2));
+    TEST_ASSERT_TRUE(sc2_link_session_active(0xFFC2));
+    TEST_ASSERT_EQUAL_UINT8(4, sc2_link_expected_words(0xFFC2));
+    TEST_ASSERT_EQUAL_UINT8(2, sc2_link_protocol_version(0xFFC2));
     TEST_ASSERT_FALSE(sc2_link_session_active(0x0231));
     TEST_ASSERT_EQUAL_UINT8(3, sc2_link_expected_words(0x0231));
 }
@@ -851,6 +915,15 @@ void test_hello_waits_for_silence_while_a_session_runs(void) {
     TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_DELIVERED, sc2_link_client_hello(&client, &fake_transport));
     TEST_ASSERT_EQUAL_INT(1, fake_link.silences);
     assert_sent(0, sc2_link_hello_words, SC2_LINK_HELLO_WORD_COUNT);
+}
+
+/* A dongle of another protocol version reads the words differently, so it gets no message. */
+void test_hello_refuses_another_protocol_version(void) {
+    fake_link.model.version = 1;
+    sc2_link_message_t nop = sc2_link_nop_message();
+    TEST_ASSERT_EQUAL(SC2_LINK_CLIENT_FAILED, sc2_link_client_deliver(&client, &fake_transport, &nop));
+    TEST_ASSERT_FALSE(client.in_session);
+    TEST_ASSERT_EQUAL_INT(SC2_LINK_HELLO_WORD_COUNT, fake_link.sent_count);
 }
 
 void test_hello_without_acknowledgement_fails(void) {
@@ -1002,7 +1075,8 @@ int main() {
     RUN_TEST(test_session_word);
     RUN_TEST(test_reports_at_full_range);
     RUN_TEST(test_round_trip_every_boundary);
-    RUN_TEST(test_narrow_fields_stay_in_their_bits);
+    RUN_TEST(test_every_side);
+    RUN_TEST(test_command_stays_in_its_bits);
     RUN_TEST(test_command_kinds_rebuild_report_0x82);
     RUN_TEST(test_pulse_rebuilds_report_0x81);
     RUN_TEST(test_tone_rebuilds_report_0x83);
@@ -1011,6 +1085,8 @@ int main() {
     RUN_TEST(test_host_rumble_rebuilds_report_0x80);
     RUN_TEST(test_effect_durations_saturate);
     RUN_TEST(test_unknown_effect_kind_has_no_message);
+    RUN_TEST(test_targets_go_out_as_the_side);
+    RUN_TEST(test_targets_above_side_max_have_no_message);
     RUN_TEST(test_magnitudes);
     RUN_TEST(test_ack_state_fields);
     RUN_TEST(test_state_advanced);
@@ -1021,6 +1097,7 @@ int main() {
     RUN_TEST(test_full_queue_drops_oldest_effect);
     RUN_TEST(test_hello_opens_a_session);
     RUN_TEST(test_hello_waits_for_silence_while_a_session_runs);
+    RUN_TEST(test_hello_refuses_another_protocol_version);
     RUN_TEST(test_hello_without_acknowledgement_fails);
     RUN_TEST(test_toggles_alternate_across_messages);
     RUN_TEST(test_a_session_lost_mid_message_restarts_it);

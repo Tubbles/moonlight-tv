@@ -16,7 +16,9 @@
 
 #include <Limelight.h>
 
-#define SC2_LINK_PROTOCOL_VERSION 1
+#define SC2_LINK_PROTOCOL_VERSION 2
+// The highest side byte: the dongle ends the session on a header with side 6 or 7.
+#define SC2_LINK_SIDE_MAX 5
 #define SC2_LINK_HELLO_WORD_COUNT 4
 // SWEEP and TONE: a header and four payload words.
 #define SC2_LINK_MESSAGE_WORDS_MAX 5
@@ -111,7 +113,9 @@ extern const uint16_t sc2_link_hello_words[SC2_LINK_HELLO_WORD_COUNT];
 
 /*
  * One message each, named after the report the dongle builds from it. Side is
- * 0 none, 1 left, 2 right, 3 both, as in the reports.
+ * the report's side byte, 0 to SC2_LINK_SIDE_MAX. For 0x82 to 0x85: 0 left
+ * pad, 1 right pad, 2 both pads, 3 left grip, 4 right grip, 5 both grips.
+ * 0x81 swaps the pads: 0 right, 1 left, 2 both.
  */
 
 /** Report 0x82, command as in SDL's haptic_type_t: 0 off, 1 tick, 2 click, 4 rumble, 5 noise. */
@@ -145,7 +149,8 @@ sc2_link_message_t sc2_link_bye_message(void);
 
 /**
  * The message from which the dongle rebuilds the report that libvirtualhid
- * decoded into this effect on the host. False for a kind it has none for.
+ * decoded into this effect on the host. False for a kind it has none for and
+ * for a target above SC2_LINK_SIDE_MAX.
  */
 bool sc2_link_haptic_effect_message(const LI_CONTROLLER_HAPTIC_EFFECT *effect, sc2_link_message_t *message);
 

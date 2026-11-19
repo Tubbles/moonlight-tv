@@ -7,10 +7,10 @@
 #define TOGGLE_SHIFT 15
 #define DATA_MASK 0x7FFFu
 
-// A header with data bit 14 set is a COMMAND, whose 13 bits leave no room for
-// an opcode. Otherwise bits 13 to 11 hold the opcode.
+// A header with data bit 14 set is a COMMAND, whose 14 bits fill the word and
+// leave no room for an opcode. Otherwise bits 13 to 11 hold the opcode.
 #define COMMAND_BIT 0x4000u
-#define COMMAND_SHIFT 10
+#define COMMAND_SHIFT 11
 #define COMMAND_MASK 0x7u
 #define OPCODE_SHIFT 11
 #define OPCODE_CONTROL 0u
@@ -25,7 +25,7 @@
 #define CONTROL_BYE 0x02u
 
 #define SIDE_SHIFT 8
-#define SIDE_MASK 0x3u
+#define SIDE_MASK 0x7u
 // Both speeds zero, no payload.
 #define RUMBLE_STOP_BIT 0x0004u
 
@@ -114,7 +114,7 @@ sc2_link_message_t sc2_link_pulse_message(uint8_t side, uint16_t on_us, uint16_t
     return message_of(data_words, 4, false);
 }
 
-/* Its 58 bits do not fit a header and three payload words, so the high bits get a fifth. */
+/* Its 59 bits do not fit a header and three payload words, so the high bits get a fifth. */
 sc2_link_message_t sc2_link_sweep_message(uint8_t side, int8_t gain_db, uint16_t duration_ms, uint16_t start_hz,
                                           uint16_t end_hz) {
     unsigned int high_bits = high_bit(duration_ms, 2) | high_bit(start_hz, 1) | high_bit(end_hz, 0);
@@ -154,6 +154,11 @@ sc2_link_message_t sc2_link_bye_message(void) {
 /*
  * The inverse of libvirtualhid's decode_steam_controller_haptic_effect()
  * (src/core/report.cpp, e9ede639), whose fields Sunshine passes on unchanged.
+ * Its target is the report's side byte for 1 to 3, under the names left, right
+ * and both, and 0 for every other side byte. So the target goes out as the
+ * side unchanged, which is the side Steam sent except for the right grip (4)
+ * and both grips (5) of 0x82 to 0x85: those arrive as 0 and play on side 0. A
+ * target above SC2_LINK_SIDE_MAX names no actuator.
  * Report 0x82 becomes the kind named by its command, so OFF, TICK, CLICK,
  * RUMBLE and NOISE are commands. Its commands 3, 6 and 7 decode to the kinds
  * of reports 0x83, 0x85 and 0x84 with every other field zero, which this
@@ -163,6 +168,9 @@ sc2_link_message_t sc2_link_bye_message(void) {
  */
 bool sc2_link_haptic_effect_message(const LI_CONTROLLER_HAPTIC_EFFECT *effect, sc2_link_message_t *message) {
     uint8_t side = effect->target;
+    if (side > SC2_LINK_SIDE_MAX) {
+        return false;
+    }
     switch (effect->kind) {
         case LI_HAPTIC_EFFECT_OFF:
         case LI_HAPTIC_EFFECT_TICK:
