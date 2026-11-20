@@ -32,8 +32,8 @@ bool session_handle_input_event(session_t *session, const SDL_Event *event) {
             stream_input_handle_ctouchpad(input, &event->ctouchpad);
             break;
         }
-        case SDL_CONTROLLERDEVICEADDED: {
-            stream_input_handle_cdevice(input, &event->cdevice);
+        case SDL_JOYDEVICEADDED: {
+            stream_input_handle_jdevice_added(input, &event->jdevice);
             break;
         }
         case SDL_MOUSEMOTION: {

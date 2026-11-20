@@ -615,8 +615,17 @@ void stream_input_update_touchpad_tap_hold(stream_input_t *input) {
     }
 }
 
-void stream_input_handle_cdevice(stream_input_t *input, const SDL_ControllerDeviceEvent *event) {
-    app_gamepad_state_t *gamepad = app_input_gamepad_state_by_instance_id(input->input, event->which);
+/*
+ * On the joystick event, not the controller one: SDL queues SDL_CONTROLLERDEVICEADDED ahead of the
+ * SDL_JOYDEVICEADDED it stems from, so it arrives before app_input has opened the controller.
+ */
+void stream_input_handle_jdevice_added(stream_input_t *input, const SDL_JoyDeviceEvent *event) {
+    // The added event carries the device index. It equals the instance id only until a controller is replugged.
+    SDL_JoystickID instance_id = SDL_JoystickGetDeviceInstanceID(event->which);
+    if (instance_id < 0) {
+        return;
+    }
+    app_gamepad_state_t *gamepad = app_input_gamepad_state_by_instance_id(input->input, instance_id);
     if (gamepad == NULL) {
         return;
     }

@@ -92,7 +92,7 @@ void stream_input_handle_csensor(stream_input_t *input, const SDL_ControllerSens
 
 void stream_input_handle_ctouchpad(stream_input_t *input, const SDL_ControllerTouchpadEvent *event);
 
-void stream_input_handle_cdevice(stream_input_t *input, const SDL_ControllerDeviceEvent *event);
+void stream_input_handle_jdevice_added(stream_input_t *input, const SDL_JoyDeviceEvent *event);
 
 void stream_input_update_touchpad_tap_hold(stream_input_t *input);
 
