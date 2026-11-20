@@ -15,6 +15,7 @@
 #include <linux/input.h>
 
 #include <SDL_gamecontroller.h>
+#include <SDL_timer.h>
 #include <Limelight.h>
 
 #include "input/app_input.h"
@@ -24,6 +25,10 @@
 #define DEV_INPUT_ROOT "/dev/input"
 #define NODE_PATH_MAX 64
 #define NODE_TEXT_MAX 128
+
+// A dongle plugged in or switching mode gets its xpad node first: on a PC the last HID node came 79 ms later.
+#define HID_NODES_WAIT_MS 1000
+#define HID_NODES_RETRY_MS 20
 
 // Bounds how long stopping the reader blocks the caller.
 #define POLL_TIMEOUT_MS 50
@@ -69,6 +74,8 @@ typedef struct controller_reader_t {
 typedef void (*frame_handler_t)(controller_reader_t *reader);
 
 static bool is_sc2_link_xpad(const app_gamepad_state_t *gamepad);
+
+static bool wait_for_hid_nodes(node_location_t *controls, node_location_t *pads, node_location_t *motion);
 
 static bool find_hid_nodes(node_location_t *controls, node_location_t *pads, node_location_t *motion);
 
@@ -147,7 +154,7 @@ bool session_sc2_link_take_over(session_sc2_link_t *link, const app_gamepad_stat
     }
     session_sc2_link_stop(link);
     node_location_t controls, pads, motion;
-    if (!find_hid_nodes(&controls, &pads, &motion)) {
+    if (!wait_for_hid_nodes(&controls, &pads, &motion)) {
         commons_log_warn("SC2Link", "Controller #%d is an SC2 Link dongle, but its HID nodes were not found",
                          gamepad->gs_id);
         return false;
@@ -213,6 +220,17 @@ static bool is_sc2_link_xpad(const app_gamepad_state_t *gamepad) {
     return controller != NULL &&
            sc2_link_is_xpad(SDL_GameControllerGetVendor(controller), SDL_GameControllerGetProduct(controller),
                             SDL_GameControllerGetProductVersion(controller));
+}
+
+/** Blocks the caller, the main thread, for at most HID_NODES_WAIT_MS, and only while nodes are missing. */
+static bool wait_for_hid_nodes(node_location_t *controls, node_location_t *pads, node_location_t *motion) {
+    for (int waited_ms = 0; waited_ms < HID_NODES_WAIT_MS; waited_ms += HID_NODES_RETRY_MS) {
+        if (find_hid_nodes(controls, pads, motion)) {
+            return true;
+        }
+        SDL_Delay(HID_NODES_RETRY_MS);
+    }
+    return find_hid_nodes(controls, pads, motion);
 }
 
 /**
